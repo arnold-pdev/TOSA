@@ -1,6 +1,239 @@
-# NITO-3D Data & TOSA Setup Guide
+# TOSA Sprint Guide — Data, ANSYS, and Sensitivity Post-Processing
 
-This document summarizes how the TOSA sprint project relates to the **NITO-3D** dataset and what to do next. **TOSA** is our project name; the upstream work is **NITO-3D** (Neural Implicit Topology Optimization for 3D).
+**TOSA** (this repo) implements sensitivity analysis of topology-optimized designs: how **global compliance** \(C\) responds to **design variables** (e.g. element densities \(\rho_e\)) for a fixed set of constraints and loads.
+
+**NITO-3D** is the upstream public dataset (reference designs and problem definitions). We do **not** re-run NITO training in this sprint; we use NITO cases as inputs to an independent FEA + sensitivity pipeline.
+
+## Sprint goal
+
+| Stage | Tool | Output |
+|-------|------|--------|
+| Problem definition | NITO `.npy` + export scripts | Geometry/topology, mesh resolution, BCs, loads, \(V_f\) |
+| Forward FEA | **ANSYS** | Displacement field \(\mathbf{u}\) (and optionally strain energy per element) |
+| Sensitivity & viz | **Python** | Compliance \(C\), gradient \(\partial C / \partial \rho_e\) (or \(\partial C / \partial \rho\)), plots |
+
+ANSYS is the source of truth for the **displacement field** under the chosen material model and boundary conditions. Python aggregates ANSYS exports into **compliance** and the **compliance gradient** for plotting and comparison with theory (e.g. adjoint / SIMP-style sensitivities).
+
+## End-to-end pipeline
+
+```mermaid
+flowchart LR
+  subgraph inputs [NITO sample i]
+    T[topologies.npy]
+    S[shapes.npy]
+    BC[boundary_conditions.npy]
+    L[loads.npy]
+    VF[vfs.npy]
+  end
+
+  subgraph prep [Export / prep]
+    E[ANSYS model\ngeometry + material + BCs + loads]
+  end
+
+  subgraph fea [ANSYS]
+    F[Solve]
+    U[Displacement field u]
+  end
+
+  subgraph py [Python post-process]
+    C[Compliance C]
+    G[dC/drho plot]
+  end
+
+  T --> E
+  S --> E
+  BC --> E
+  L --> E
+  VF --> E
+  E --> F --> U --> C --> G
+```
+
+### What each layer is responsible for
+
+**NITO data (index `i`)**
+
+- `topologies[i]` → material layout / design variables \(\rho\) on a structured voxel grid.
+- `shapes[i]` → \((n_x, n_y, n_z)\) element counts (physical domain size must be chosen or inferred when building the ANSYS model).
+- `boundary_conditions[i]`, `loads[i]` → sparse point constraints and forces (normalized coordinates; scale by `np.max(shapes[i])` for physical placement — see below).
+- `vfs[i]` → target volume fraction (constraint reference, not necessarily enforced in a one-off ANSYS run).
+
+**ANSYS**
+
+- Build mesh and material model (linear elasticity is the usual starting point).
+- Apply displacement BCs and forces consistent with the NITO case.
+- Solve and export **nodal or element results** needed for compliance and sensitivities (at minimum displacements; element strain energy density simplifies gradient assembly).
+
+**Python**
+
+- Read ANSYS exports (CSV, RST via `ansys-mapdl-reader`, ACT result files, etc. — choose one format and stick to it).
+- Compute **compliance** from reactions/energy or \(\mathbf{F}^\top \mathbf{u}\) on the loaded DOFs.
+- Compute **\(\partial C / \partial \rho_e\)** for plotting (see [Compliance and sensitivity](#compliance-and-sensitivity-post-processing)).
+
+## Compliance and sensitivity (post-processing)
+
+For linear elasticity with external loads \(\mathbf{F}\) and stiffness \(\mathbf{K}(\boldsymbol{\rho})\):
+
+\[
+C = \mathbf{F}^\top \mathbf{u} = \mathbf{u}^\top \mathbf{K} \mathbf{u}
+\]
+
+Design variables are the **element (or voxel) densities** \(\rho_e\) used in topology optimization (SIMP-style penalization may apply in the reference NITO solver; match that exponent if comparing to published compliances).
+
+A standard **element-wise compliance sensitivity** (used in density-based TO) is:
+
+\[
+\frac{\partial C}{\partial \rho_e} = -p \, \rho_e^{p-1} \, \mathbf{u}_e^\top \mathbf{K}_e \mathbf{u}_e
+\]
+
+where \(p\) is the penalization power and \(\mathbf{u}_e\), \(\mathbf{K}_e\) are the element displacement and stiffness in local form. Equivalently, this is often implemented using **strain energy density** from the solved field: Python can sum/contour-map \(\partial C / \partial \rho_e\) per element if ANSYS exports per-element energy or if \(\mathbf{u}\) is mapped back to a consistent mesh.
+
+**Sprint deliverables (Python side):**
+
+- One sample index \(i\) end-to-end: NITO → ANSYS → export → \(C\) and \(\partial C / \partial \rho\) fields.
+- Plots: topology, \(|\mathbf{u}|\) or components, and sensitivity map (e.g. voxel-colored \(\partial C / \partial \rho_e\)).
+- Document ANSYS export format and unit/coordinate conventions.
+
+**Open engineering choices** (decide early):
+
+| Choice | Notes |
+|--------|--------|
+| Physical domain size | NITO stores grid dimensions in voxels; assign \(L_x, L_y, L_z\) or unit cell size for ANSYS. |
+| Material model | Start with uniform \(E, \nu\); void/solid via \(\rho_e\) or element kill. |
+| Mesh ↔ voxel mapping | 1:1 hex elements vs coarser ANSYS mesh; sensitivities must use the same DOF/element numbering as \(\rho\). |
+| ANSYS product | Mechanical (MAPDL) vs Workbench; drives export path and automation (APDL / PyMechanical / journal files). |
+
+## Suggested next steps (sprint order)
+
+1. **Environment** — Python 3.10+ (`tosa` env); ANSYS install/license confirmed.
+2. **Data** — Download NITO **test** split into `database/` (~85 MB); pick 1–3 fixed indices for the sprint.
+3. **Visual sanity check** — `authors_reading.ipynb` or `nates_reading.py` to confirm topology, BCs, loads for those indices.
+4. **ANSYS case 0** — Manual (or scripted) model for one index: mesh, BCs, loads, solve, export \(\mathbf{u}\).
+5. **Python reader** — Script to load ANSYS output + compute \(C\) and a first sensitivity map; plot alongside topology.
+6. **Batch / parametric** — Optional: loop indices or perturb \(\rho_e\) for finite-difference checks on \(\partial C / \partial \rho_e\).
+7. **Scale up** — More indices or train split only if needed for statistics.
+
+## Feasibility, maintainability, and environment (recommendations)
+
+### Feasibility — sprint is realistic with tight scope
+
+| In scope for a sprint | Out of scope (defer) |
+|------------------------|----------------------|
+| 1–3 NITO indices end-to-end | Batch all 122K cases in ANSYS |
+| One consistent mesh/voxel convention | Perfect match to NITO SIMP compliance values |
+| Python \(C\) and \(\partial C/\partial\rho_e\) maps + plots | Fully automated ANSYS from day one |
+| FD check on one element’s \(\rho\) | Rebuilding NITO’s GPU solver or training |
+
+**What will take the most time:** not the sensitivity formula in Python, but **building the first ANSYS model** that matches NITO’s topology, BCs, and loads (normalized coordinates, sparse point constraints, void/solid material layout). Treat the first case as a **geometry/BC translation problem**; post-processing is straightforward once exports share the same element ordering as \(\rho\).
+
+**Highest risk:** mesh and design variables not aligned (ANSYS mesh ≠ NITO voxel grid). Fix by committing to **one structured hex mesh** with the same \(n_x \times n_y \times n_z\) as `shapes[i]` and a written unit scale (e.g. 1 voxel = 1 mm).
+
+**De-risk path:** solve index `i` manually in ANSYS → export → Python → compare one FD perturbation on a single voxel before automating export or batching.
+
+### Maintainability — keep stages separable
+
+Design the repo so each stage has a **stable contract** (inputs/outputs on disk), not shared global state in a notebook.
+
+```text
+database/
+  manifest/              # YAML per index: units, penalization p, file paths
+  samples/{i}/           # exported from NITO (rho.npy, bc.json, loads.json, meta.yaml)
+  ansys/{i}/             # journal, RST/CSV, logs (ANSYS-owned artifacts)
+  postprocess/           # pure Python; reads samples/ + ansys/
+  results/{i}/           # C, dC/drho arrays, figures
+```
+
+Principles:
+
+- **Manifest per sample** (`samples/{i}/meta.yaml`): `index`, `shape`, `Lx,Ly,Lz`, `p`, `E`, `nu`, paths to ANSYS export. Reproducibility lives here.
+- **Python postprocess has no ANSYS license dependency** if you export CSV or VTK from ANSYS; use `ansys-mapdl-reader` only if you standardize on `.rst`.
+- **Do not fork NITO_Public** into TOSA; clone beside the repo and pin a commit hash in the manifest or root README.
+- **Notebooks for exploration only**; scripts (`export_sample.py`, `compliance.py`) for the pipeline you keep.
+- **Version the export schema** (column names, units) in `meta.yaml` when it changes.
+
+### Pipeline — three phases, one interface
+
+```mermaid
+flowchart TB
+  subgraph p1 [Phase 1 — NITO export]
+    M[manifest YAML]
+    X[export_sample.py]
+    M --> X
+  end
+
+  subgraph p2 [Phase 2 — ANSYS]
+    J[journal / Workbench]
+    R[RST or CSV export]
+    J --> R
+  end
+
+  subgraph p3 [Phase 3 — Python]
+    P[compliance.py]
+    V[validate_fd.py optional]
+    P --> V
+  end
+
+  X -->|samples/i/| J
+  R -->|ansys/i/| P
+  P -->|results/i/| OUT[plots + npy]
+```
+
+| Phase | Owner | Automation level (sprint) |
+|-------|--------|---------------------------|
+| **1. Export** | Python | Script from `.npy` → `samples/{i}/` (high value, low risk) |
+| **2. FEA** | ANSYS | **Manual first**, then APDL/journal template per `shape` class |
+| **3. Post** | Python | Fully scripted; unit-testable with a tiny synthetic mesh |
+
+Phase 2 should not block Phase 3: stub a **minimal fake export** (one hex, known \(\mathbf{u}\)) so sensitivity code and plots can be developed in parallel with ANSYS setup.
+
+### Environment — two tiers, not the full NITO stack
+
+ANSYS is **outside** conda; Python env only needs what post-processing and NITO export use.
+
+**Tier A — `tosa` (daily driver, any machine)**
+
+| Package | Purpose |
+|---------|---------|
+| `python=3.10` | Match existing notebook / NITO notes |
+| `numpy`, `scipy` | Arrays, optional sparse helpers |
+| `matplotlib` | Sensitivity / topology plots |
+| `pandas` | ANSYS CSV tables |
+| `pyyaml` | Sample manifests |
+| `gdown` | One-time NITO download |
+| `scikit-image` | Optional; marching-cubes viz |
+| `pyvista` | Optional; `nates_reading.py` only |
+
+**Tier B — add when export format is fixed**
+
+| Package | When |
+|---------|------|
+| `ansys-mapdl-reader` | Standardizing on `.rst` from MAPDL |
+| `ansys-mechanical-stubs` / PyMechanical | Only if you automate Mechanical **and** have a licensed install on that machine |
+
+**Do not install for this sprint:** PyTorch, TensorFlow, full `NITO_Public/environment.yml` (CUDA, training stack), unless you explicitly train NITO models later.
+
+**ANSYS:** document product (Mechanical vs MAPDL), version, and license server in team notes — not in conda. Run ANSYS on a **designated workstation**; commit **exported results** (or store on shared drive) so others can run Tier A postprocess without a license.
+
+**Suggested files in repo:**
+
+```text
+requirements.txt       # Tier A pins
+environment.yml        # optional conda mirror of Tier A
+.gitignore             # *.npy data, ansys/{i}/*.rst, large results
+```
+
+### Summary recommendation
+
+1. **Scope:** prove the loop on **one index**, then three; ignore train-scale data until the contract is stable.
+2. **Pipeline:** manifest-driven folders; script export + postprocess; ANSYS manual → templated.
+3. **Environment:** slim `tosa` conda env for Python; ANSYS separate; add `ansys-mapdl-reader` only if you commit to RST.
+4. **Validation:** one FD perturbation on \(\rho\) before trusting \(\partial C/\partial\rho_e\) plots.
+5. **Maintainability:** freeze units, `p`, and mesh rules in `meta.yaml`; keep ANSYS artifacts and Python code in sibling directories.
+
+---
+
+## NITO-3D data reference
+
+The sections below cover dataset source, size, download, and the existing visualization notebooks.
 
 ## Source project
 
@@ -86,7 +319,7 @@ This downloads **train + test** (10 files). There is no official per-sample down
 
 **Train-only or test-only:** edit `download.py` to run only `data_ids` or `test_data_ids`, or download individual files manually from Drive using the IDs in `download.py`.
 
-**Checkpoints** (optional, for running their models): `python download.py --checkpoints` — not needed for visualization-only TOSA work.
+**Checkpoints** (optional, for running their models): `python download.py --checkpoints` — not needed for the ANSYS + sensitivity sprint.
 
 ## Python environment
 
@@ -100,9 +333,21 @@ pyvista         # nates_reading.py (interactive 3D)
 jupyter
 ipykernel
 gdown           # for download.py
+# Add when ANSYS export format is chosen, e.g.:
+# ansys-mapdl-reader   # RST results
+# pandas               # CSV exports
 ```
 
 **Skip unless needed:** `tensorflow` (imported in the notebook but unused), full NITO_Public `environment.yml` (PyTorch/CUDA stack) unless training NITO models.
+
+**Future repo layout (planned):**
+
+```text
+database/
+  samples/          # per-index exports for ANSYS (STL, input decks, etc.)
+  ansys_results/    # ANSYS displacement / energy exports per run
+  postprocess/       # Python: compliance + dC/drho scripts
+```
 
 Example conda env:
 
@@ -113,7 +358,9 @@ conda install -c conda-forge numpy matplotlib scikit-image pyvista jupyter ipyke
 python -m ipykernel install --user --name tosa --display-name "tosa"
 ```
 
-## Two visualization paths in this repo
+## Visualization (sanity checks before ANSYS)
+
+Use these to verify NITO geometry and BC/load placement for the indices you will run in ANSYS:
 
 | Script | Stack | Notes |
 |--------|--------|------|
@@ -149,25 +396,27 @@ python train.py --data ./Data --start_index 0 --end_index 1000
 
 This limits which indices are processed but **does not** avoid loading full `.npy` files into memory.
 
-## Suggested next steps
-
-1. **Install Python 3.10+** (Windows Store `python` stub is not sufficient).
-2. **Create `tosa` conda env** with packages above.
-3. **Clone NITO_Public** beside TOSA (optional but useful for `download.py` and format reference).
-4. **Download test data** into `database/` (~85 MB) and run `authors_reading.ipynb` or `nates_reading.py`.
-5. **Verify data:** `len(shapes)`, spot-check `shapes[i]` and `topologies[i].reshape(shapes[i])`.
-6. **Document chosen indices** for sensitivity experiments (fixed set for reproducibility).
-7. **Download full train bundle** when you need scale beyond the 2K test set.
-8. **(Optional)** Add `inspect_data.py` or a cache helper for index subsets — not in repo yet.
-
 ## Open questions / gaps
 
-- Paper mentions both **106,425** and **122K** topology counts in different sections; treat **122K** as the public release scale and verify with `len(shapes)` after download.
-- No per-sample IDs or metadata file in the release — derive filters from `shapes[i]`, `vfs[i]`, and BC/load patterns if needed.
-- **Hongrui’s clarification:** multiply normalized BC/load positions by `np.max(dims)` when plotting.
+**Data (NITO)**
+
+- Paper mentions both **106,425** and **122K** topology counts; verify with `len(shapes)` after download.
+- No per-sample metadata file — derive filters from `shapes[i]`, `vfs[i]`, and BC/load patterns.
+- **Hongrui’s clarification:** multiply normalized BC/load positions by `np.max(dims)` when placing BCs/loads in ANSYS or plots.
+
+**ANSYS + sensitivity**
+
+- Fixed physical domain size and SIMP penalization \(p\) if comparing to NITO reference compliance.
+- Whether ANSYS exports **reactions + displacements** only, or also **element strain energy** (affects simplest gradient implementation).
+- Validation: compare Python \(\partial C / \partial \rho_e\) to finite differences on one voxel for a single case.
 
 ## Related files
 
-- `authors_reading.ipynb` — matplotlib / marching-cubes viewer
-- `nates_reading.py` — PyVista viewer
-- Upstream: `NITO_Public/download.py`, `NITO/utils.py` (`NITO_Dataset.load(idx)`)
+| File | Role |
+|------|------|
+| `authors_reading.ipynb` | Visual check — matplotlib / marching cubes |
+| `nates_reading.py` | Visual check — PyVista |
+| `NITO_Public/download.py` | Dataset download |
+| `NITO_Public/NITO/utils.py` | `NITO_Dataset.load(idx)` — reference for indexing |
+| *(planned)* `postprocess/compliance.py` | Compliance + gradient from ANSYS exports |
+| *(planned)* `samples/export_ansys.py` | NITO index → ANSYS input |
