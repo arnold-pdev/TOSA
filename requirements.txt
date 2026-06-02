@@ -1,6 +1,9 @@
 # TOSA Tier A — NITO export, ANSYS post-processing, plotting
 # ANSYS itself is installed separately (not pip).
 # Add ansys-mapdl-reader when standardizing on .rst exports.
+#
+# ATOMS solver (nito/ATOMS): see requirements-atoms.txt and environment.yml
+# (needs scikit-sparse via conda on macOS).
 
 numpy>=1.24,<3
 scipy>=1.10
@@ -12,3 +15,4 @@ gdown>=5.0
 # Optional visualization (authors_reading / nates_reading)
 scikit-image>=0.21
 pyvista>=0.42
+tqdm>=4.65

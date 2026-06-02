@@ -1,0 +1,14 @@
+# ATOMS (nito/ATOMS) — SIMP FEA / topology optimization solver
+# Prefer environment.yml (conda) for scikit-sparse / SuiteSparse on macOS.
+# Run from nito/:  python -c "from ATOMS.solver import Solver"
+
+numpy>=1.24,<3
+scipy>=1.10
+pandas>=2.0
+matplotlib>=3.7
+pyvista>=0.42
+tqdm>=4.65
+
+# scikit-sparse provides sksparse.cholmod (required by solver.py).
+# On macOS, install via conda-forge instead of pip when possible:
+#   conda install -c conda-forge scikit-sparse suitesparse

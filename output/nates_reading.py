@@ -1,12 +1,17 @@
 import matplotlib.pyplot as plt
 import pyvista as pv
 import numpy as np
+from pathlib import Path
 
-shapes = np.load('shapes.npy')
-bc = np.load('boundary_conditions.npy', allow_pickle=True)
-loads = np.load('loads.npy', allow_pickle=True)
-vfs = np.load('vfs.npy')
-topologies = np.load('topologies.npy', allow_pickle=True)
+# NITO raw data lives in the submodule (see nito/download.py).
+REPO_ROOT = Path(__file__).resolve().parents[1]
+DATA_DIR = REPO_ROOT / "nito" / "Data"
+
+shapes = np.load(DATA_DIR / "shapes.npy")
+bc = np.load(DATA_DIR / "boundary_conditions.npy", allow_pickle=True)
+loads = np.load(DATA_DIR / "loads.npy", allow_pickle=True)
+vfs = np.load(DATA_DIR / "vfs.npy")
+topologies = np.load(DATA_DIR / "topologies.npy", allow_pickle=True)
 
 # For an example topology
 # i = 3

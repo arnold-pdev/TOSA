@@ -1,0 +1,50 @@
+# --- NITO data (download via scripts/fetch_data.sh) ---
+nito/Data/
+
+# --- TOSA generated results (scripts/sensitivity_analysis/main.py) ---
+output/atoms_results/*
+!output/atoms_results/.gitkeep
+
+# --- Figures from visualize_nito_sample.py ---
+output/figures/*
+!output/figures/.gitkeep
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+*.egg-info/
+.eggs/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# --- Jupyter ---
+.ipynb_checkpoints/
+
+# --- OS / editor ---
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*~
+
+# --- Secrets / local env ---
+.env
+.env.*
+!.env.example
+
+# --- Optional ML / large binaries (uncomment if you add these) ---
+# *.pt
+# *.pth
+# checkpoints/

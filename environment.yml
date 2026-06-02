@@ -1,0 +1,21 @@
+# TOSA Python env — Tier A (output/postprocess) + ATOMS (SIMP solver)
+# ANSYS is installed separately. GPU (cupy) is optional; not included on macOS.
+name: tosa
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - numpy>=1.24,<3
+  - scipy>=1.10
+  - pandas>=2.0
+  - matplotlib>=3.7
+  - pyyaml>=6.0
+  - tqdm>=4.65
+  - gdown>=5.0
+  - scikit-image>=0.21
+  - pyvista>=0.42
+  # ATOMS: sparse Cholesky (hard import in solver.py)
+  - scikit-sparse>=0.4.12
+  - suitesparse
+  - jupyter>=1.0
+  - ipykernel>=6.0

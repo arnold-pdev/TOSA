@@ -105,7 +105,7 @@ where \(p\) is the penalization power and \(\mathbf{u}_e\), \(\mathbf{K}_e\) are
 ## Suggested next steps (sprint order)
 
 1. **Environment** — Python 3.10+ (`tosa` env); ANSYS install/license confirmed.
-2. **Data** — Download NITO **test** split into `database/` (~85 MB); pick 1–3 fixed indices for the sprint.
+2. **Data** — Download NITO data into `nito/Data/` (~85 MB test split under `nito/Data/Test/`); pick 1–3 fixed indices for the sprint.
 3. **Visual sanity check** — `authors_reading.ipynb` or `nates_reading.py` to confirm topology, BCs, loads for those indices.
 4. **ANSYS case 0** — Manual (or scripted) model for one index: mesh, BCs, loads, solve, export \(\mathbf{u}\).
 5. **Python reader** — Script to load ANSYS output + compute \(C\) and a first sensitivity map; plot alongside topology.
@@ -134,12 +134,11 @@ where \(p\) is the penalization power and \(\mathbf{u}_e\), \(\mathbf{K}_e\) are
 Design the repo so each stage has a **stable contract** (inputs/outputs on disk), not shared global state in a notebook.
 
 ```text
-database/
-  manifest/              # YAML per index: units, penalization p, file paths
-  samples/{i}/           # exported from NITO (rho.npy, bc.json, loads.json, meta.yaml)
-  ansys/{i}/             # journal, RST/CSV, logs (ANSYS-owned artifacts)
-  postprocess/           # pure Python; reads samples/ + ansys/
-  results/{i}/           # C, dC/drho arrays, figures
+nito/Data/               # raw NITO .npy (from download.py; gitignored)
+output/
+  atoms_results/{i}/     # ATOMS: C, dC/drho, U, rho (from sensitivity script)
+  manifest/              # optional YAML per index: units, penalization p, file paths
+  samples/{i}/           # optional per-index exports / meta
 ```
 
 Principles:
@@ -255,7 +254,7 @@ From the NITO-3D paper (Table 1) and measured Drive file sizes:
 | Topologies (headline) | **~122,000** |
 | Total voxel elements | **4.3 billion** |
 | Voxels per topology (min / max) | **32,000 / 48,000** (e.g. 40×40×20, 120×40×10) |
-| Held-out test set | **2,000** samples |
+| Held-out test set | **5,000** samples |
 | Unique BC templates | **210** configurations, **7** domain shapes/resolutions |
 
 **On-disk size (train + test, all five `.npy` files each):**
@@ -271,26 +270,37 @@ After download, confirm sample count:
 ```python
 import numpy as np
 print(len(np.load("shapes.npy")))  # expect ~122K for train
+print(len(np.load("Test/shapes.npy")))  # expect 5000 for test
 ```
 
 **RAM note:** Loading the full train set with `np.load(..., allow_pickle=True)` can use noticeably more than 5 GB RAM due to pickle/object-array overhead. Prefer the **test split** for early exploration.
 
 ## Files and layout
 
-Scripts in this folder expect these paths **relative to `database/`** (working directory must be `database/`):
+**Raw NITO data** lives in the submodule (not in `output/`):
 
 ```
-database/
+nito/Data/
   shapes.npy
   boundary_conditions.npy
   loads.npy
   topologies.npy
-  vfs.npy              # used by nates_reading.py only
-  authors_reading.ipynb
-  nates_reading.py
+  vfs.npy
+  Test/                # test split (~85 MB)
+    *.npy
 ```
 
-For NITO_Public’s layout, the same files live under `Data/` (train) and `Data/Test/` (test). Copy or symlink into `database/` or point download output here.
+**This folder (`output/`)** holds TOSA notebooks, docs, and run artifacts:
+
+```
+output/
+  README.md
+  authors_reading.ipynb
+  nates_reading.py
+  atoms_results/{i}/   # written by scripts/sensitivity_analysis/main.py
+```
+
+Download with `python download.py --data` from `nito/` (default `nito/Data/`).
 
 ### Per-sample schema (index `i`)
 
@@ -311,11 +321,16 @@ All arrays are aligned by integer index `i`:
 From a clone of NITO_Public (needs `gdown`):
 
 ```bash
-conda activate tosa   # or your env
-python download.py --data --data_dir /path/to/TOSA/database
+conda activate tosa
+./scripts/fetch_data.sh --test-only    # sprint default: nito/Data/Test/ (~85 MB)
+# or: python scripts/fetch_nito_data.py --test-only
 ```
 
-This downloads **train + test** (10 files). There is no official per-sample download API.
+Full train + test (~4.7 GB): `./scripts/fetch_data.sh --full`
+
+Upstream bulk download (no test-only): `cd nito && python download.py --data`
+
+There is no official per-sample download API (whole files only).
 
 **Train-only or test-only:** edit `download.py` to run only `data_ids` or `test_data_ids`, or download individual files manually from Drive using the IDs in `download.py`.
 
@@ -343,10 +358,8 @@ gdown           # for download.py
 **Future repo layout (planned):**
 
 ```text
-database/
-  samples/          # per-index exports for ANSYS (STL, input decks, etc.)
-  ansys_results/    # ANSYS displacement / energy exports per run
-  postprocess/       # Python: compliance + dC/drho scripts
+output/
+  atoms_results/{i}/   # compliance.npy, dC_drho.npy, displacement.npy, ...
 ```
 
 Example conda env:
@@ -358,14 +371,22 @@ conda install -c conda-forge numpy matplotlib scikit-image pyvista jupyter ipyke
 python -m ipykernel install --user --name tosa --display-name "tosa"
 ```
 
-## Visualization (sanity checks before ANSYS)
+## Visualization (sanity checks)
 
-Use these to verify NITO geometry and BC/load placement for the indices you will run in ANSYS:
+Verify topology, BCs, and loads before running sensitivity analysis:
+
+```bash
+conda activate tosa
+python scripts/inspect_nito_dataset.py --test          # 2D vs 3D counts and templates
+python scripts/visualize_nito_sample.py --index 0 --test
+python scripts/visualize_nito_sample.py --index 0 --test --save output/figures/sample_0.png --no-show
+```
 
 | Script | Stack | Notes |
 |--------|--------|------|
-| `authors_reading.ipynb` | Matplotlib + scikit-image marching cubes | Matches authors’ plotting style; inline figures |
-| `nates_reading.py` | PyVista | Interactive windows; loops `i in range(0, 20)` — close each window to continue |
+| `scripts/visualize_nito_sample.py` | PyVista | CLI: one index, optional PNG export |
+| `authors_reading.ipynb` | Matplotlib + scikit-image marching cubes | Authors’ plotting style |
+| `nates_reading.py` | PyVista | Legacy loop over indices 0–19 |
 
 ## Pull-only-what-you-need workflow
 
@@ -379,10 +400,10 @@ NITO supports **index-based** use after files exist, not streaming single sample
 
 **Practical TOSA approach:**
 
-1. **Sprint start:** download only `Data/Test/*.npy` (~85 MB, ~2K samples).
+1. **Sprint start:** download only `Data/Test/*.npy` (~85 MB, 5k samples).
 2. **Work by index:** e.g. `ID_IDX = 10` in the notebook, or `topologies[i]` in the script.
 3. **Full train later:** download train bundle (~4.6 GB) when sensitivity/training needs it.
-4. **Optional cache layer:** extract chosen indices to `database/cache/{i}/` so TOSA code does not load 122K samples every run (not provided by NITO; add locally if needed).
+4. **Optional cache layer:** extract chosen indices to `output/cache/{i}/` so TOSA code does not load 122K samples every run (not provided by NITO; add locally if needed).
 
 `shapes.npy` and `vfs.npy` are small — useful to download first for scouting indices before pulling `topologies.npy`.
 
