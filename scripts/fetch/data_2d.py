@@ -1,26 +1,35 @@
 #!/usr/bin/env python3
 """
-Download NITO-3D .npy bundles into nito/Data/ (TOSA wrapper; submodule stays vanilla).
+Download NITO 2D .npy bundles into nito/Data/ (TOSA wrapper; submodule stays vanilla).
 
 Drive file IDs match nito/download.py in NITO_Public — update both if upstream changes.
 
 Usage (from repo root, tosa env with gdown installed):
 
-    python scripts/fetch_nito_data.py --test-only      # sprint default (~85 MB)
-    python scripts/fetch_nito_data.py --full           # train + test (~4.7 GB)
+    ./scripts/fetch/data_2d.sh --test-only      # sprint default (~85 MB)
+    ./scripts/fetch/data_2d.sh --full           # train + test (~4.7 GB)
 """
 
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
+
+_SCRIPTS = Path(__file__).resolve().parents[1]
+if str(_SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(_SCRIPTS))
+
+from lib.paths import ensure_scripts_on_path
+
+ensure_scripts_on_path()
 
 import gdown
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
+from lib.paths import REPO_ROOT
+
 DEFAULT_DATA_DIR = REPO_ROOT / "nito" / "Data"
 
-# Keep in sync with nito/download.py (NITO_Public submodule).
 TRAIN_IDS = {
     "topologies.npy": "1VitnaTfJtkEqY5jFIdfyB132-8Gu7s7u",
     "boundary_conditions.npy": "1CYqL9BMR6PiM9PfE81VZIWyPIK1hDzAR",
@@ -61,7 +70,7 @@ def download_bundle(
 
 def parse_args() -> argparse.Namespace:
     group = argparse.ArgumentParser(
-        description="Download NITO data into nito/Data/ without modifying the submodule."
+        description="Download NITO 2D data into nito/Data/ without modifying the submodule."
     )
     scope = group.add_mutually_exclusive_group()
     scope.add_argument(

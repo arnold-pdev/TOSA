@@ -1,0 +1,29 @@
+# Git and editor
+.git
+.gitignore
+.idea
+.vscode
+.cursor
+
+# Local-only work
+local/
+
+# Large/generated data (mount at runtime instead)
+nito/Data/
+nito/Checkpoints/
+output/
+public/stl/
+public/vtp/
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# OS
+.DS_Store
+Thumbs.db

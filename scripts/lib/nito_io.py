@@ -6,7 +6,8 @@ from pathlib import Path
 
 import numpy as np
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
+from lib.paths import REPO_ROOT
+
 DEFAULT_DATA_DIR = REPO_ROOT / "nito" / "Data"
 
 REQUIRED_FILES = (
@@ -28,7 +29,7 @@ def load_nito_arrays(data_dir: Path) -> dict[str, np.ndarray]:
     if missing:
         raise FileNotFoundError(
             f"Missing in {data_dir}: {', '.join(missing)}. "
-            "Run: ./scripts/fetch_data.sh --test-only"
+            "Run: ./scripts/fetch/data_2d.sh --test-only"
         )
     return {
         "shapes": np.load(data_dir / "shapes.npy", allow_pickle=True),

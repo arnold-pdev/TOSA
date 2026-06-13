@@ -8,11 +8,16 @@ Visualize one NITO sample: topology, boundary conditions, and loads.
 Examples:
 
     conda activate tosa
-    python scripts/visualize_nito_sample.py --index 0 --test
-    python scripts/visualize_nito_sample.py --index 0 --test --with-gradient
-    python scripts/visualize_nito_sample.py --index 0 --test --with-gradient --gradient-binary
-    python scripts/visualize_nito_sample.py --index 0 --test --with-gradient \\
-        --save output/figures/sample_0_sensitivity.png --no-show
+    python scripts/voxel/visualize.py --index 0 --test
+    python scripts/voxel/visualize.py --index 0 --test --with-gradient
+    python scripts/voxel/visualize.py --index 0 --test --with-gradient --gradient-binary
+    # NITO ML design (after voxel/predict.py):
+    python scripts/voxel/visualize.py --index 0 --test \\
+        --rho-file output/nito_predictions/0/rho_pred.npy --no-show \\
+        --save output/figures/sample_0_nito_pred.png
+    python scripts/voxel/visualize.py --index 0 --test --with-gradient \\
+        --atoms-results output/atoms_results/nito_pred/0 --no-show \\
+        --save output/figures/sample_0_nito_pred_grad.png
 """
 
 from __future__ import annotations
@@ -26,11 +31,15 @@ import numpy as np
 import pyvista as pv
 from matplotlib.patches import Patch, Polygon
 
-_SCRIPTS = Path(__file__).resolve().parent
+_SCRIPTS = Path(__file__).resolve().parents[1]
 if str(_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS))
 
-from nito_io import (
+from lib.paths import ensure_scripts_on_path
+
+ensure_scripts_on_path()
+
+from lib.nito_io import (
     REPO_ROOT,
     load_nito_arrays,
     load_sample,
@@ -216,14 +225,14 @@ def physical_points_xyz(rows: np.ndarray, shape: np.ndarray) -> np.ndarray:
 
 
 def load_atoms_results(results_dir: Path) -> dict[str, np.ndarray | float]:
-    """Load outputs written by scripts/sensitivity_analysis/main.py."""
+    """Load outputs written by scripts/voxel/sensitivity/compliance.py."""
     results_dir = Path(results_dir)
     required = ("dC_drho.npy", "shape.npy")
     missing = [n for n in required if not (results_dir / n).exists()]
     if missing:
         raise FileNotFoundError(
             f"Missing in {results_dir}: {', '.join(missing)}. "
-            "Run: python scripts/sensitivity_analysis/main.py --index <i> --test"
+            "Run: python scripts/voxel/sensitivity/compliance.py --index <i> --test"
         )
     out: dict[str, np.ndarray | float] = {
         "dC_drho": np.load(results_dir / "dC_drho.npy"),
@@ -663,6 +672,13 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Directory with dC_drho.npy (default: output/atoms_results/<index>)",
     )
+    p.add_argument(
+        "--rho-file",
+        type=Path,
+        default=None,
+        help="Design field for left panel (e.g. output/nito_predictions/<i>/rho_pred.npy); "
+        "default: dataset topology or rho.npy from --atoms-results",
+    )
     return p.parse_args()
 
 
@@ -675,6 +691,16 @@ def main() -> None:
         raise IndexError(f"index {args.index} out of range [0, {n})")
 
     shape, rho, bc, load, vf = load_sample(data, args.index)
+    if args.rho_file is not None:
+        rho_path = Path(args.rho_file)
+        if not rho_path.is_file():
+            raise FileNotFoundError(f"--rho-file not found: {rho_path}")
+        rho = np.load(rho_path, allow_pickle=True).astype(float).reshape(-1, 1)
+        if rho.size != int(np.prod(shape)):
+            raise ValueError(
+                f"--rho-file length {rho.size} != shape.prod() {int(np.prod(shape))}"
+            )
+
     nd = shape_ndim(shape)
     if args.only_2d and nd != 2:
         raise ValueError(f"index {args.index} is {nd}D, not 2D (shape={shape})")
@@ -693,7 +719,7 @@ def main() -> None:
         sens = load_atoms_results(results_dir)
         dC_drho = np.asarray(sens["dC_drho"])
         compliance = sens.get("compliance")
-        if "rho" in sens:
+        if args.rho_file is None and "rho" in sens:
             rho = np.asarray(sens["rho"]).reshape(-1, 1)
         shape = np.asarray(sens["shape"], dtype=int)
 

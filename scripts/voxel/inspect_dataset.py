@@ -4,9 +4,9 @@ Report which NITO samples are 2D vs 3D (from shapes.npy).
 
 Examples:
 
-    python scripts/inspect_nito_dataset.py --test
-    python scripts/inspect_nito_dataset.py --test --list-2d --limit 20
-    python scripts/inspect_nito_dataset.py --test --save output/dataset_summary.json
+    python scripts/voxel/inspect_dataset.py --test
+    python scripts/voxel/inspect_dataset.py --test --list-2d --limit 20
+    python scripts/voxel/inspect_dataset.py --test --save output/dataset_summary.json
 """
 
 from __future__ import annotations
@@ -16,11 +16,15 @@ import json
 import sys
 from pathlib import Path
 
-_SCRIPTS = Path(__file__).resolve().parent
+_SCRIPTS = Path(__file__).resolve().parents[1]
 if str(_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS))
 
-from nito_io import (
+from lib.paths import ensure_scripts_on_path
+
+ensure_scripts_on_path()
+
+from lib.nito_io import (
     REPO_ROOT,
     indices_by_ndim,
     load_nito_arrays,

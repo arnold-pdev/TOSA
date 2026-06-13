@@ -1,0 +1,26 @@
+# TOSA container — mount repo + data, run scripts inside a single env.
+#
+#   docker compose build tosa
+#   docker compose run --rm tosa bash
+#   docker compose run --rm tosa python scripts/voxel/visualize.py --index 119 \
+#       --data-dir nito/Data/3D --no-show --save output/figures/sample_119.png
+#
+# Large paths (nito/Data, output/) are bind-mounted so artifacts persist on the host.
+
+services:
+  tosa:
+    platform: linux/amd64
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: tosa:latest
+    container_name: tosa
+    working_dir: /workspace
+    stdin_open: true
+    tty: true
+    environment:
+      OMP_NUM_THREADS: ${OMP_NUM_THREADS:-4}
+      PETSC_OPTIONS: "-ksp_type preonly -pc_type lu"
+    volumes:
+      - .:/workspace
+    command: bash

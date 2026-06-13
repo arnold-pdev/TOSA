@@ -1,13 +1,25 @@
-# --- NITO data (download via scripts/fetch_data.sh) ---
+local/
+# --- NITO data (download via scripts/fetch/data_2d.sh) ---
 nito/Data/
 
-# --- TOSA generated results (scripts/sensitivity_analysis/main.py) ---
+# --- Pre-trained NITO weights (nito/download.py --checkpoints) ---
+nito/Checkpoints/
+
+# --- NITO inference outputs (scripts/voxel/predict.py) ---
+output/nito_predictions/*
+!output/nito_predictions/.gitkeep
+
+# --- TOSA generated results (scripts/voxel/sensitivity/compliance.py) ---
 output/atoms_results/*
 !output/atoms_results/.gitkeep
 
-# --- Figures from visualize_nito_sample.py ---
+# --- Figures from scripts/voxel/visualize.py ---
 output/figures/*
 !output/figures/.gitkeep
+
+# --- Surface meshes (VTP distribution; legacy STL cache) ---
+public/vtp/
+public/stl/
 
 # --- Python ---
 __pycache__/

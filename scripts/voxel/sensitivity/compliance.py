@@ -1,18 +1,16 @@
+#!/usr/bin/env python3
 """
-TOSA sensitivity analysis — compliance gradient w.r.t. element densities rho.
+Voxel density-based compliance sensitivity (dC/drho via ATOMS).
 
-Loads a NITO-3D design from the .npy bundles produced by nito/download.py, runs
-ATOMS forward FEA, and returns dC/drho using the same adjoint chain rule as the
-SIMP optimizer (density filter + SIMP penalty).
+Operates on voxel/grid designs from NITO .npy bundles (or --rho-file). Gradient
+w.r.t. element densities rho — not shape derivatives on STL surfaces.
 
-Run from anywhere; ATOMS is imported from the nito/ submodule:
+Usage:
 
-    conda activate tosa
-    python scripts/sensitivity_analysis/main.py --index 0 --data-dir nito/Data --test
-
-Prerequisite data (from repo root):
-
-    cd nito && python download.py --data
+    ./scripts/voxel/sensitivity/compliance.sh --index 0 --test
+    python scripts/voxel/sensitivity/compliance.py --index 3 --test \\
+        --rho-file output/nito_predictions/3/rho_pred.npy \\
+        --output-dir output/atoms_results/nito_pred/3
 """
 
 from __future__ import annotations
@@ -24,11 +22,16 @@ from pathlib import Path
 
 import numpy as np
 
-# ATOMS lives under nito/; evaluate.py uses the same import style.
-REPO_ROOT = Path(__file__).resolve().parents[2]
+_SCRIPTS = Path(__file__).resolve().parents[2]
+if str(_SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(_SCRIPTS))
+
+from lib.nito_io import load_nito_arrays, load_sample
+from lib.paths import REPO_ROOT, ensure_nito_on_path
+
+ensure_nito_on_path()
+
 NITO_ROOT = REPO_ROOT / "nito"
-if str(NITO_ROOT) not in sys.path:
-    sys.path.insert(0, str(NITO_ROOT))
 
 from ATOMS.MaterialModels import SingleMaterial
 from ATOMS.geometry import generate_structured_mesh
@@ -36,44 +39,6 @@ from ATOMS.solver import Solver
 from ATOMS.utils import filter_2D_structured, filter_3D_structured
 
 logger = logging.getLogger(__name__)
-
-
-def load_nito_arrays(data_dir: Path) -> dict[str, np.ndarray]:
-    """Load aligned NITO arrays from a download.py output directory."""
-    required = (
-        "shapes.npy",
-        "topologies.npy",
-        "boundary_conditions.npy",
-        "loads.npy",
-        "vfs.npy",
-    )
-    missing = [name for name in required if not (data_dir / name).exists()]
-    if missing:
-        raise FileNotFoundError(
-            f"Missing in {data_dir}: {', '.join(missing)}. "
-            "Run: ./scripts/fetch_data.sh --test-only"
-        )
-    return {
-        "shapes": np.load(data_dir / "shapes.npy", allow_pickle=True),
-        "topologies": np.load(data_dir / "topologies.npy", allow_pickle=True),
-        "boundary_conditions": np.load(
-            data_dir / "boundary_conditions.npy", allow_pickle=True
-        ),
-        "loads": np.load(data_dir / "loads.npy", allow_pickle=True),
-        "vfs": np.load(data_dir / "vfs.npy", allow_pickle=True),
-    }
-
-
-def load_sample(
-    data: dict[str, np.ndarray], index: int
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]:
-    """Return (shape, rho, BC, load, vf) for one dataset index."""
-    shape = np.asarray(data["shapes"][index], dtype=int)
-    rho = np.asarray(data["topologies"][index], dtype=float).reshape(-1, 1)
-    bc = np.asarray(data["boundary_conditions"][index], dtype=float)
-    load = np.asarray(data["loads"][index], dtype=float)
-    vf = float(data["vfs"][index])
-    return shape, rho, bc, load, vf
 
 
 def build_solver(
@@ -136,13 +101,7 @@ def build_solver(
 def apply_nito_bcs(
     solver: Solver, shape: np.ndarray, bc: np.ndarray, load: np.ndarray
 ) -> None:
-    """
-    Map NITO BC/load rows onto nearest mesh nodes.
-
-    Positions are already normalized to the unit domain used by
-    generate_structured_mesh(dim=shape / shape.max(), ...) — same convention as
-    nito/evaluate.py (no extra scaling by shape.max()).
-    """
+    """Map NITO BC/load rows onto nearest mesh nodes (unit-domain convention)."""
     dim = shape.size
 
     solver.reset_BC()
@@ -176,9 +135,7 @@ def compliance_and_gradient(
     """
     Compute compliance C and dC/drho at fixed design rho.
 
-    rho is (n_elements, 1). The returned gradient is w.r.t. those design variables,
-    including the chain rule through the density filter and SIMP penalty
-    (ATOMS Solver.system_solve, same as the first TO iteration).
+    Gradient includes chain rule through density filter and SIMP penalty.
     """
     rho = np.asarray(rho, dtype=float).reshape(-1, 1)
     solver_fn = _solver_fn(solver)
@@ -211,7 +168,6 @@ def compliance_and_gradient(
         tol=solver.solve_tol,
     )
 
-    # Expand free DOF displacements to full nodal field (n_nodes, dim).
     U = np.zeros(solver.node_positions.shape[0] * solver.dim, dtype=float)
     free = np.where(solver.c.reshape(-1) == 0)[0]
     U[free] = U_free
@@ -257,20 +213,29 @@ def finite_difference_check(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Compute compliance and dC/drho for a NITO design via ATOMS."
+        description=(
+            "[Archived] Density-based compliance sensitivity (dC/drho) on "
+            "voxel/grid designs via ATOMS."
+        )
     )
     parser.add_argument(
         "--data-dir",
         type=Path,
         default=REPO_ROOT / "nito" / "Data",
-        help="NITO data directory (shapes/topologies/BC/load/vfs .npy); default nito/Data",
+        help="NITO data directory (shapes/topologies/BC/load/vfs .npy)",
     )
     parser.add_argument(
         "--test",
         action="store_true",
-        help="Use <data-dir>/Test (test split from download.py)",
+        help="Use <data-dir>/Test (test split)",
     )
     parser.add_argument("--index", type=int, default=0, help="Sample index in dataset")
+    parser.add_argument(
+        "--rho-file",
+        type=Path,
+        default=None,
+        help="Density field instead of topologies.npy (e.g. NITO rho_pred.npy)",
+    )
     parser.add_argument("--penalty", type=float, default=3.0, help="SIMP penalty p")
     parser.add_argument(
         "--solver",
@@ -282,7 +247,7 @@ def parse_args() -> argparse.Namespace:
         "--filter-radius",
         type=float,
         default=None,
-        help="Density filter radius in physical units (default 1.5/shape.max())",
+        help="Density filter radius (default 1.5/shape.max())",
     )
     parser.add_argument(
         "--output-dir",
@@ -313,6 +278,16 @@ def main() -> None:
         raise IndexError(f"index {args.index} out of range [0, {n_samples})")
 
     shape, rho, bc, load, vf = load_sample(data, args.index)
+    if args.rho_file is not None:
+        rho_file = Path(args.rho_file)
+        if not rho_file.is_file():
+            raise FileNotFoundError(f"--rho-file not found: {rho_file}")
+        rho = np.load(rho_file, allow_pickle=True).astype(float).reshape(-1, 1)
+        if rho.size != int(np.prod(shape)):
+            raise ValueError(
+                f"--rho-file length {rho.size} != shape.prod() {int(np.prod(shape))}"
+            )
+        logger.info("Using design from %s", rho_file)
     logger.info(
         "Sample %d: shape=%s, n_elements=%d, vf=%.4f",
         args.index,

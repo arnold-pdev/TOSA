@@ -1,10 +1,15 @@
-# TOSA Python env — Tier A (output/postprocess) + ATOMS (SIMP solver)
-# ANSYS is installed separately. GPU (cupy) is optional; not included on macOS.
+# TOSA — full project env (postprocess, ATOMS, NITO inference, FEA/meshing)
+# Local:  micromamba env create -f environment.yml && micromamba activate tosa
+# Docker: docker compose build tosa
+#
+# ANSYS is installed separately (not in this env).
+# Upstream NITO training uses nito/environment.yml (CUDA) — not for TOSA.
 name: tosa
 channels:
   - conda-forge
 dependencies:
   - python=3.10
+  # Core
   - numpy>=1.24,<3
   - scipy>=1.10
   - pandas>=2.0
@@ -17,5 +22,18 @@ dependencies:
   # ATOMS: sparse Cholesky (hard import in solver.py)
   - scikit-sparse>=0.4.12
   - suitesparse
+  # FEA: FEniCSx + mesh I/O
+  - fenics-dolfinx
+  - mpich
+  - petsc4py
+  - meshio>=5.3,<6
+  # Notebooks
   - jupyter>=1.0
   - ipykernel>=6.0
+  - pip
+  - pip:
+      # NITO inference
+      - torch>=2.0,<3
+      # FEA meshing (Gmsh SDK wheel; TetGen via PyVista/tetgen)
+      - gmsh>=4.12,<5
+      - tetgen>=0.8,<0.9
