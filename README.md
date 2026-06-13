@@ -38,22 +38,47 @@ Data and outputs are **not** baked into the image; download on the host (or insi
 | **Install** | `docker compose build tosa` | `micromamba env create -f environment.yml && micromamba activate tosa` |
 | **Run** | `docker compose run --rm tosa bash` | `conda activate tosa` |
 | **Best for** | FEniCSx, batch jobs, Apple Silicon hosts | Quick 2D / ATOMS density SA on Linux x86_64 |
-| **Platform** | `linux/amd64` (consistent FEA + scikit-sparse) | Native OS; FEniCSx/Gmsh can be finicky on macOS ARM |
+| **Platform** | `linux/amd64` (see below) | Native OS; FEniCSx/Gmsh can be finicky on macOS ARM |
+
+**Requirements:** [Docker Desktop](https://www.docker.com/products/docker-desktop/) (or Docker Engine + Compose v2). First build downloads conda packages and PyTorch wheels (~2 GB+); allow 15–30 minutes on a cold cache.
+
+**Image (`tosa:latest`):** micromamba env from `environment.yml` — Python 3.10, PyTorch, ATOMS/scikit-sparse, FEniCSx, Gmsh, TetGen, PyVista, Jupyter. Build ends with an import smoke test (`dolfinx`, `gmsh`, `tetgen`, `meshio`, `pyvista`, `torch`). See [`Dockerfile`](Dockerfile) and [`docker-compose.yml`](docker-compose.yml).
+
+**Why `linux/amd64`:** `scikit-sparse` (ATOMS Cholesky) has no conda-forge build for `linux/arm64`. On Apple Silicon, Docker otherwise defaults to arm64 and the env solve fails. Compose and the Dockerfile pin `linux/amd64`; the container runs under x86_64 emulation on ARM Macs — slower than native arm64, but required for the full stack.
+
+**Bind mount:** the repo root is mounted at `/workspace` (`.:/workspace` in compose). Edits on the host are visible in the container; `nito/Data/`, `output/`, checkpoints, and figures persist on the host without rebuilding. Submodule `nito/` must exist on the host (`git submodule update --init nito`) before running ATOMS/NITO scripts.
+
+**Environment (compose):**
+
+| Variable | Default | Role |
+|----------|---------|------|
+| `OMP_NUM_THREADS` | `4` | OpenMP threads for BLAS / parallel libs |
+| `PETSC_OPTIONS` | `-ksp_type preonly -pc_type lu` | Direct LU for FEniCSx linear solves |
+
+Override at run time, e.g. `OMP_NUM_THREADS=8 docker compose run --rm tosa …`.
 
 **Docker workflow**
 
 ```bash
 git submodule update --init nito
 docker compose build tosa
-./scripts/fetch/data_2d.sh --test-only
+./scripts/fetch/data_2d.sh --test-only   # on host; writes into nito/Data/
 docker compose run --rm tosa bash
-# inside container (repo at /workspace):
+# inside container (cwd /workspace):
 python scripts/voxel/sensitivity/compliance.py --index 0 --test
 python scripts/voxel/visualize.py --index 0 --test --no-show \
   --save output/figures/sample_0.png
 ```
 
-Use `--no-show --save …` for PyVista inside the container (no display server). One-shot commands work without an interactive shell: `docker compose run --rm tosa python scripts/…`.
+One-shot (no interactive shell):
+
+```bash
+docker compose run --rm tosa python scripts/voxel/predict.py --index 3 --test
+docker compose run --rm tosa python scripts/voxel/visualize.py --index 119 \
+  --data-dir nito/Data/3D --no-show --save output/figures/sample_119.png
+```
+
+Use `--no-show --save …` for PyVista — there is no display server in the container. Fetch scripts can also run inside the container; running them on the host is usually simpler since the data directory is shared via the mount.
 
 **Local workflow**
 
@@ -367,6 +392,8 @@ Surface shape derivatives (FEniCS path) will use boundary contraction of strain 
 
 | Path | In git? | Role |
 |------|---------|------|
+| `Dockerfile`, `docker-compose.yml` | Yes | Reproducible env (`tosa:latest`); see [Docker vs local](#docker-vs-local) |
+| `environment.yml` | Yes | Conda env (local or image build) |
 | `nito/Data/` | No | Downloaded `.npy` bundles |
 | `nito/Checkpoints/` | No | Pre-trained `.pth` weights |
 | `public/vtp/` | No | Distribution surface meshes |
