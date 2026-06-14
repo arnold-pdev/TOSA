@@ -19,6 +19,9 @@ dependencies:
   - gdown>=5.0
   - scikit-image>=0.21
   - pyvista>=0.42
+  # voxel2surf: marching-cubes surface + optional watertight repair
+  - trimesh>=4.0
+  - pymeshfix>=0.16
   # ATOMS: sparse Cholesky (hard import in solver.py)
   - scikit-sparse>=0.4.12
   - suitesparse

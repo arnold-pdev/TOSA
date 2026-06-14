@@ -17,6 +17,10 @@ output/atoms_results/*
 output/figures/*
 !output/figures/.gitkeep
 
+# --- Surface pipeline experiment runs ---
+output/surfaces/runs/*
+!output/surfaces/runs/.gitkeep
+
 # --- Surface meshes (VTP distribution; legacy STL cache) ---
 public/vtp/
 public/stl/

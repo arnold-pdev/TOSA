@@ -125,7 +125,7 @@ flowchart LR
   end
 
   subgraph mesh [Meshing]
-    GM[Gmsh / TetGen / structured]
+    GM[Gmsh / TetGen]
     VM[volume mesh]
     GM --> VM
   end
@@ -215,7 +215,7 @@ That does **not** mean the interior can always be coarse:
 | Thin / high-curvature features | Fine to moderate | Geometric fidelity of \(\Omega\) |
 | Thick interior bulk | Coarse | Elliptic regularity; resultants dominate far from loads |
 
-Structured fallback meshes (regular tets ∩ solid) use the same **principle** — finer at the surface layer and load neighborhoods — with simpler heuristics until Gmsh/TetGen size fields are wired in `scripts/surface/sensitivity/main.py`.
+Gmsh and TetGen backends apply the same **principle** — finer at the surface layer and load neighborhoods — via `lib/meshing/size_fields.py` and the backend drivers in `lib/meshing/`.
 
 **Implemented today** (voxel density SA — archived, still functional):
 
@@ -407,26 +407,24 @@ Surface shape derivatives (FEniCS path) will use boundary contraction of strain 
 
 ```
 scripts/
-  lib/                  # nito_io, surface_io, stl_common, paths
+  lib/                  # shared modules
+    nito_io.py, nito_physics.py, surface_io.py, stl_common.py, paths.py
+    meshing/            # automatic volume mesh (Gmsh / TetGen)
+      size_fields.py    # boundary / load / feature sizing
+      mesh.py           # backend dispatch
+      gmsh.py, tetgen.py
+    fea/                # FEniCSx solve + boundary postprocess
+      bcs.py, problem.py, postprocess.py
   fetch/                # downloads + colocated .sh wrappers
-    data_2d.py / data_2d.sh
-    data_3d.py / data_3d.sh
-    stl.py / stl.sh
-    checkpoints.py / checkpoints.sh
-    clean_stl.py / clean_stl.sh
   voxel/                # .npy grids, ρ, ATOMS density SA
-    inspect_dataset.py
-    predict.py
-    visualize.py
-    sensitivity/
-      compliance.py
-      compliance.sh
-  surface/              # STL/VTP, FEniCS shape-derivative SA
-    convert.py
-    visualize.py
-    sensitivity/
-      main.py
+    inspect_dataset.py, predict.py, visualize.py
+    sensitivity/compliance.py, compliance.sh
+  surface/              # STL/VTP, shape-derivative SA orchestration
+    convert.py, visualize.py
+    sensitivity/main.py   # calls lib/meshing → lib/fea → .vtp
 ```
+
+Legacy top-level `scripts/sensitivity/` and `scripts/sensitivity_analysis/` have been **removed**; surface SA lives under `scripts/surface/sensitivity/`, voxel SA under `scripts/voxel/sensitivity/`.
 
 | Entry point | Purpose |
 |-------------|---------|
@@ -434,7 +432,9 @@ scripts/
 | `scripts/fetch/data_3d.sh` | 3D train → `nito/Data/3D/` |
 | `scripts/fetch/stl.sh` | Selected STLs → `public/stl/` |
 | `scripts/fetch/checkpoints.sh` | NITO checkpoints |
-| `scripts/surface/sensitivity/main.py` | Surface SA → `.vtp` (upcoming) |
+| `scripts/lib/meshing/` | Automatic volume meshing (size fields, Gmsh/TetGen) |
+| `scripts/lib/fea/` | FEniCSx elasticity + boundary shape-derivative postprocess |
+| `scripts/surface/sensitivity/main.py` | Orchestrator: mesh → FEA → `.vtp` (in progress) |
 | `scripts/voxel/sensitivity/compliance.py` | Voxel ∂C/∂ρ (ATOMS) |
 | `scripts/voxel/predict.py` | NITO inference |
 | `scripts/voxel/visualize.py` | 2D/3D voxel viz + gradients |

@@ -8,6 +8,7 @@ import numpy as np
 import pyvista as pv
 
 from lib.paths import REPO_ROOT
+from lib.meshing.surface_tags import PATCH_ID_KEY, VTK_SUFFIXES
 
 DEFAULT_SURFACE_DIR = REPO_ROOT / "public" / "vtp"
 COORD_SCALAR_FIELDS = frozenset({"x", "y", "z"})
@@ -27,8 +28,11 @@ def resolve_surface_path(
         path = surface_file.expanduser().resolve()
         if not path.is_file():
             raise FileNotFoundError(f"Surface file not found: {path}")
-        if path.suffix.lower() not in {".vtp", ".stl", ".vtk", ".ply"}:
-            raise ValueError(f"Unsupported surface format: {path.suffix}")
+        if path.suffix.lower() not in {".vtp", ".vtk", ".stl", ".ply"}:
+            raise ValueError(
+                f"Unsupported surface format: {path.suffix}. "
+                f"Use VTK PolyData ({', '.join(sorted(VTK_SUFFIXES))}) for the FEA path."
+            )
         return path
     if index is None:
         raise ValueError("Provide --index or --surface-file")
@@ -36,7 +40,7 @@ def resolve_surface_path(
     if not path.is_file():
         raise FileNotFoundError(
             f"Surface not found: {path}\n"
-            "Expected VTK PolyData (.vtp) for distribution/visualization."
+            "Expected tagged VTK PolyData (.vtp) from voxel2surf or convert."
         )
     return path
 
@@ -52,6 +56,14 @@ def load_surface(path: Path) -> pv.PolyData:
 
 def point_scalar_names(mesh: pv.PolyData) -> list[str]:
     return list(mesh.point_data.keys())
+
+
+def cell_scalar_names(mesh: pv.PolyData) -> list[str]:
+    return list(mesh.cell_data.keys())
+
+
+def has_patch_tags(mesh: pv.PolyData) -> bool:
+    return PATCH_ID_KEY in mesh.cell_data
 
 
 def resolve_scalar_field(mesh: pv.PolyData, field: str) -> tuple[pv.PolyData, str]:

@@ -20,17 +20,42 @@ REQUIRED_FILES = (
 
 
 def resolve_data_dir(data_dir: Path | None, *, test: bool) -> Path:
+    """
+    Resolve the directory containing NITO ``*.npy`` bundles.
+
+    When ``data_dir`` is omitted and ``test`` is false, tries ``Data/3D`` then
+    ``Data`` then ``Data/Test`` so voxel/surface CLIs work without ``--data-dir``.
+    """
     root = (data_dir or DEFAULT_DATA_DIR).resolve()
-    return root / "Test" if test else root
+    if test:
+        return root / "Test"
+
+    if data_dir is not None:
+        return root
+
+    for candidate in (root / "3D", root, root / "Test"):
+        if all((candidate / name).is_file() for name in REQUIRED_FILES):
+            return candidate
+    return root
+
+
+def _missing_files_hint(data_dir: Path, missing: list[str]) -> str:
+    """Actionable hint when the bundle is not at ``data_dir``."""
+    lines = [f"Missing in {data_dir}: {', '.join(missing)}."]
+    if data_dir.name != "3D" and (data_dir / "3D").is_dir():
+        alt = data_dir / "3D"
+        lines.append(f"3D train data may be at {alt} — try: --data-dir {alt}")
+    if data_dir.name != "Test" and (data_dir / "Test").is_dir():
+        alt = data_dir / "Test"
+        lines.append(f"Test split may be at {alt} — try: --data-dir {alt} --test")
+    lines.append("Fetch: ./scripts/fetch/data_3d.sh  or  ./scripts/fetch/data_2d.sh --test-only")
+    return " ".join(lines)
 
 
 def load_nito_arrays(data_dir: Path) -> dict[str, np.ndarray]:
     missing = [name for name in REQUIRED_FILES if not (data_dir / name).exists()]
     if missing:
-        raise FileNotFoundError(
-            f"Missing in {data_dir}: {', '.join(missing)}. "
-            "Run: ./scripts/fetch/data_2d.sh --test-only"
-        )
+        raise FileNotFoundError(_missing_files_hint(data_dir, missing))
     return {
         "shapes": np.load(data_dir / "shapes.npy", allow_pickle=True),
         "topologies": np.load(data_dir / "topologies.npy", allow_pickle=True),

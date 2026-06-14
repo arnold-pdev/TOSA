@@ -14,7 +14,7 @@
 FROM --platform=linux/amd64 mambaorg/micromamba:1.5.10
 
 LABEL org.opencontainers.image.title="tosa"
-LABEL org.opencontainers.image.description="TOSA — NITO, ATOMS, FEniCSx, Gmsh, TetGen"
+LABEL org.opencontainers.image.description="TOSA — NITO, ATOMS, FEniCSx, Gmsh, TetGen, voxel2surf"
 
 USER root
 WORKDIR /workspace
@@ -47,7 +47,7 @@ COPY nito/ /workspace/nito/
 COPY public/ATTRIBUTION.md /workspace/public/ATTRIBUTION.md
 
 RUN micromamba run -n tosa python -c \
-    "import dolfinx, gmsh, tetgen, meshio, pyvista, torch; gmsh.initialize(); gmsh.finalize()"
+    "import dolfinx, gmsh, tetgen, meshio, pyvista, torch, trimesh, pymeshfix, skimage; gmsh.initialize(); gmsh.finalize()"
 
 ENTRYPOINT ["micromamba", "run", "-n", "tosa"]
 CMD ["bash"]
