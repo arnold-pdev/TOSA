@@ -32,14 +32,14 @@ Expand `batch/probe_indices.txt` beyond the core regression pair.
 
 | Tier | Purpose | Indices |
 |------|---------|---------|
-| **Core** | Always run | 10, 119 |
-| **BC stress** | Multi-patch, corner load, weak transfer | 119 + TBD from footprint failures |
+| **Core** | Always run | **119** |
+| **BC stress** | Multi-patch, corner load, weak transfer | 119 |
 | **VF / thin members** | Volume and slender features | TBD via `inspect_dataset` |
 | **2D sanity** | Fast iteration | one Test-split index (optional) |
 
 ### Probe set checklist
 
-- [ ] Core indices (10, 119) in `batch/probe_indices.txt`
+- [ ] Core index (119) in `batch/probe_indices.txt`
 - [ ] At least 2 BC-stress indices identified and added
 - [ ] At least 2 VF/thin-member indices identified and added
 - [ ] Optional: `probe_manifest.csv` with columns `index,tag,notes`
@@ -76,7 +76,7 @@ python scripts/surface/benchmark.py \
 - [ ] A5 `v3_taubin --taubin-iters 5` on core probes
 - [ ] A6 `v3_taubin --taubin-iters 15` on core probes
 - [ ] Compare `metrics/summary.csv` across runs
-- [ ] Visual compare on 10 and 119 (`scripts/surface/visualize.py`)
+- [ ] Visual compare on 119 (`scripts/surface/visualize.py`)
 
 ### B. BC enforcement (on best extract+smooth from A)
 
@@ -108,7 +108,7 @@ python scripts/surface/benchmark.py \
 - [ ] Document winner in `manifest.json` / team notes
 - [ ] Promote winning `vtp/` → `public/vtp/` only after gates pass
 
-**Current candidate:** `v3_taubin` (better VF on index 10 vs Laplacian; BC residual 0 on 119 in smoke runs).
+**Current candidate:** `v3_taubin` (BC residual 0 on 119 in smoke runs).
 
 ---
 
@@ -202,7 +202,7 @@ Not in the staged package yet; add recipes or stages before testing.
 
 ## Minimal matrix (48 jobs)
 
-Six runs × eight probe indices — enough to choose a default.
+Six runs on index 119 — enough to choose a default when comparing extractors/smoothers.
 
 1. `extract_only`
 2. `v3_default`
@@ -215,7 +215,7 @@ Six runs × eight probe indices — enough to choose a default.
 
 - [ ] All 6 runs completed on expanded probe set
 - [ ] All hard gates pass on chosen default
-- [ ] Visual sign-off on 10 and 119
+- [ ] Visual sign-off on 119
 - [ ] Default recipe recorded in PIPELINES.md / batch sbatch
 
 ---

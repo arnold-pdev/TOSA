@@ -11,6 +11,7 @@ Examples:
     python scripts/surface/visualize.py --surface-file out/119.vtp --scalar boundary
     python scripts/surface/visualize.py --surface-file out/119.vtp --scalar patch_id
     python scripts/surface/visualize.py --index 119 --scalar boundary --overlay-voxels --data-dir nito/Data/3D
+    python scripts/surface/visualize.py --index 119 --surface-file output/surfaces/validation/.../extract_only.vtp --scalar boundary --overlay-voxels --data-dir nito/Data/3D
     # Interactive keys: v=voxels+BC faces  s=surface  l=load markers
     python scripts/surface/visualize.py --surface-file public/vtp/119.vtp --scalar z --data-dir nito/Data/3D
     python scripts/surface/visualize.py --surface-file out/119.vtp --list-scalars
@@ -492,12 +493,17 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="Visualize a VTK surface (point scalars or BC patch tags)."
     )
-    src = p.add_mutually_exclusive_group(required=True)
-    src.add_argument(
-        "--index", type=int, help="NITO dataset index → <surface-dir>/<index>.vtp"
+    p.add_argument(
+        "--index",
+        type=int,
+        default=None,
+        help="NITO dataset index (loads <surface-dir>/<index>.vtp, or NITO voxels with --surface-file)",
     )
-    src.add_argument(
-        "--surface-file", type=Path, help="Path to .vtp / .vtk from voxel2surf"
+    p.add_argument(
+        "--surface-file",
+        type=Path,
+        default=None,
+        help="Path to .vtp / .vtk from voxel2surf (optional with --index for voxel overlay)",
     )
     p.add_argument(
         "--surface-dir",
@@ -578,6 +584,8 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    if args.index is None and args.surface_file is None:
+        raise SystemExit("Provide --index and/or --surface-file")
     path = resolve_surface_path(
         index=args.index,
         surface_file=args.surface_file,
@@ -611,8 +619,8 @@ def main() -> None:
     if need_nito and nito_index is None:
         if args.overlay_voxels or want_bc_faces:
             raise SystemExit(
-                "NITO overlay/BC faces require --index or a numeric surface filename "
-                "(e.g. 119.vtp) plus --data-dir"
+                "NITO overlay/BC faces require --index (NITO sample id) plus --data-dir. "
+                "With validation VTPs named by recipe, pass both --index 119 and --surface-file."
             )
     elif nito_index is not None:
         data_dir = resolve_data_dir(args.data_dir, test=args.test)

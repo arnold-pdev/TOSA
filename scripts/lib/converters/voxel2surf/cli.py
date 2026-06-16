@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -34,8 +35,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument(
         "--recipe",
         type=str,
-        default="v3_default",
-        help="Pipeline recipe (v3_default, v3_taubin, sdf_vf_match, extract_only)",
+        default="pyvista_laplacian",
+        help="Pipeline recipe (pyvista_laplacian, pyvista_taubin, planar_cap_contour, …)",
     )
     p.add_argument("--list-recipes", action="store_true")
     p.add_argument("--format", choices=tuple(f.value for f in SurfaceOutputFormat), default=None)
@@ -56,6 +57,57 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     g.add_argument("--meshfix-verbose", action="store_true")
     g.add_argument("--calibrate-vf", action="store_true")
     g.add_argument("--field-smooth-sigma", type=float, default=0.0)
+    g.add_argument("--field-bc-mask", action="store_true")
+    g.add_argument("--upsample-factor", type=int, default=1)
+
+    g = p.add_argument_group("BC geometry")
+    g.add_argument(
+        "--bc-transfer",
+        choices=("centroid", "cell_native"),
+        default=None,
+        help="BC label transfer backend",
+    )
+    g.add_argument("--bc-transfer-band-cells", type=float, default=1.0)
+    g.add_argument(
+        "--bc-regrow",
+        choices=("none", "geodesic"),
+        default=None,
+        help="Geodesic BC patch regrow before smooth",
+    )
+    g.add_argument("--bc-oracle", action="store_true", help="Cuberille BC QA metrics")
+    g.add_argument("--bc-strict-footprint", action="store_true")
+    g.add_argument("--bc-plane-tol", type=float, default=1e-5)
+    g.add_argument(
+        "--on-bc-fail",
+        choices=("raise", "warn"),
+        default="raise",
+        help="When labeled BC vertices deviate from NITO analytic planes",
+    )
+    g.add_argument(
+        "--no-bc-claim-coplanar",
+        action="store_true",
+        help="Do not claim unlabeled triangles on NITO BC planes before snap",
+    )
+    g.add_argument(
+        "--bc-assembly",
+        choices=("monolithic", "shared_seam"),
+        default=None,
+        help="BC assembly backend (monolithic=MC BC faces, shared_seam=plane-cut caps)",
+    )
+    g.add_argument(
+        "--bc-planar-cap",
+        action="store_true",
+        help="Build planar BC cap contours (audit only; caps are not assembled onto the skin)",
+    )
+    g.add_argument(
+        "--bc-planar-cap-method",
+        type=str,
+        default="upsample_blur",
+        help="Planar cap contour method (upsample_blur, native_contour)",
+    )
+    g.add_argument("--bc-planar-cap-upsample", type=int, default=4)
+    g.add_argument("--bc-planar-cap-blur-sigma", type=float, default=1.0)
+    g.add_argument("--bc-planar-cap-outward-buffer", type=float, default=0.25)
 
     g = p.add_argument_group("smooth")
     g.add_argument("--smoother", type=str, default=None, help="Override recipe smoother")
@@ -64,9 +116,33 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     g.add_argument("--laplacian-relaxation", type=float, default=0.5)
     g.add_argument("--taubin-iters", type=int, default=None)
     g.add_argument("--taubin-lambda", type=float, default=0.5)
-    g.add_argument("--taubin-nu", type=float, default=0.53)
+    g.add_argument(
+        "--taubin-k-pb",
+        type=float,
+        default=0.1,
+        help="Taubin pass-band frequency; μ is derived from λ and k_PB",
+    )
+    g.add_argument(
+        "--taubin-mu",
+        type=float,
+        default=None,
+        help="Explicit signed Taubin μ (<0); overrides --taubin-k-pb",
+    )
+    g.add_argument(
+        "--taubin-nu",
+        type=float,
+        default=None,
+        help="Deprecated: positive magnitude of μ; use --taubin-mu or --taubin-k-pb",
+    )
     g.add_argument("--no-constrain-bc-planes", action="store_true")
     g.add_argument("--laplacian-freeze-rings", type=int, default=0)
+    g.add_argument("--smooth-free-only", action="store_true")
+    g.add_argument("--subdivide-free-only", action="store_true")
+    g.add_argument("--hc-iters", type=int, default=None)
+    g.add_argument("--hc-lambda", type=float, default=0.5)
+    g.add_argument("--hc-alpha", type=float, default=0.1)
+    g.add_argument("--snap-to-sdf", action="store_true")
+    g.add_argument("--snap-to-sdf-steps", type=int, default=3)
 
     g = p.add_argument_group("validation")
     g.add_argument("--load-surface-tol-cells", type=float, default=1.0)
@@ -77,7 +153,6 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         choices=("raise", "warn"),
         default="raise",
     )
-    g.add_argument("--bc-strict-footprint", action="store_true")
 
     p.add_argument("--log-file", type=Path, default=None)
     p.add_argument("--log-dir", type=Path, default=None)
@@ -87,6 +162,14 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def _options_from_args(args: argparse.Namespace) -> PipelineOptions:
     recipe = get_recipe(args.recipe)
+    taubin_mu = args.taubin_mu
+    if taubin_mu is None and args.taubin_nu is not None:
+        warnings.warn(
+            "--taubin-nu is deprecated; use --taubin-mu (signed, <0) or --taubin-k-pb",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        taubin_mu = -abs(args.taubin_nu)
     opts = PipelineOptions(
         extractor=args.extractor or recipe.extractor,
         smoother=args.smoother or recipe.smoother,
@@ -98,16 +181,39 @@ def _options_from_args(args: argparse.Namespace) -> PipelineOptions:
         laplacian_relaxation=args.laplacian_relaxation,
         taubin_iters=10 if args.taubin_iters is None else args.taubin_iters,
         taubin_lambda=args.taubin_lambda,
-        taubin_nu=args.taubin_nu,
+        taubin_k_pb=args.taubin_k_pb,
+        taubin_mu=taubin_mu,
         constrain_bc_planes=not args.no_constrain_bc_planes,
         laplacian_freeze_rings=args.laplacian_freeze_rings,
         calibrate_vf=args.calibrate_vf,
         field_smooth_sigma=args.field_smooth_sigma,
+        field_bc_mask=args.field_bc_mask,
+        upsample_factor=args.upsample_factor,
+        snap_to_sdf=args.snap_to_sdf,
+        snap_to_sdf_steps=args.snap_to_sdf_steps,
         load_surface_tol_cells=args.load_surface_tol_cells,
         vf_tol_cells=args.vf_tol_cells,
         check_loads=not args.no_load_check,
         on_load_fail=args.on_load_fail,
         bc_strict_footprint=args.bc_strict_footprint,
+        bc_transfer=args.bc_transfer or "centroid",
+        bc_transfer_band_cells=args.bc_transfer_band_cells,
+        bc_regrow=args.bc_regrow or "none",
+        bc_oracle=args.bc_oracle,
+        bc_plane_tol=args.bc_plane_tol,
+        on_bc_fail=args.on_bc_fail,
+        bc_claim_coplanar=not args.no_bc_claim_coplanar,
+        bc_assembly=args.bc_assembly or recipe.bc_assembly,
+        bc_planar_cap=args.bc_planar_cap or ("bc_planar_cap" in recipe.stages),
+        bc_planar_cap_method=args.bc_planar_cap_method,
+        bc_planar_cap_upsample=args.bc_planar_cap_upsample,
+        bc_planar_cap_blur_sigma=args.bc_planar_cap_blur_sigma,
+        bc_planar_cap_outward_buffer=args.bc_planar_cap_outward_buffer,
+        smooth_free_only=args.smooth_free_only,
+        subdivide_free_only=args.subdivide_free_only,
+        hc_iters=10 if args.hc_iters is None else args.hc_iters,
+        hc_lambda=args.hc_lambda,
+        hc_alpha=args.hc_alpha,
     )
     return opts
 
@@ -152,7 +258,10 @@ def main(argv: list[str] | None = None) -> None:
     logger(f"  shape={tuple(int(x) for x in shape)}  solid_voxels={int(np.count_nonzero(vox)):,}")
     logger(
         f"  pipeline: extractor={opts.extractor} smoother={opts.smoother} "
-        f"subdivide={opts.subdivide_levels}",
+        f"subdivide={opts.subdivide_levels} "
+        f"bc_assembly={opts.bc_assembly} "
+        f"bc_planar_cap={opts.bc_planar_cap}"
+        + (f" method={opts.bc_planar_cap_method}" if opts.bc_planar_cap else ""),
     )
     logger(f"  output={out_path.resolve()}")
     if args.run_dir is not None:
@@ -193,6 +302,9 @@ def main(argv: list[str] | None = None) -> None:
         f"{len(result.patches)} BC patches, {n_bc:,} labeled triangles{load_warn})"
     )
     logger(summary)
+    construction_sec = result.bc_audit.get("construction_sec")
+    if construction_sec is not None:
+        logger(f"  construction_sec={float(construction_sec):.3f}")
     for line in vf_lines:
         logger(line)
     logger.save()
@@ -219,6 +331,11 @@ def main(argv: list[str] | None = None) -> None:
                 result.bc_audit.get("bc_plane_max_residual", 0.0),
             ),
             bc_labeled_triangles=n_bc,
+            bc_oracle_max_gap=result.bc_audit.get("bc_oracle_max_gap"),
+            bc_min_patch_tris=result.bc_audit.get("bc_min_patch_tris"),
+            free_dihedral_mean_deg=result.bc_audit.get("free_dihedral_mean_deg"),
+            free_dihedral_p95_deg=result.bc_audit.get("free_dihedral_p95_deg"),
+            axis_aligned_edge_frac=result.bc_audit.get("axis_aligned_edge_frac"),
             load_check_failed=result.load_check_failed,
             vertices=len(result.mesh.vertices),
             faces=len(result.mesh.faces),

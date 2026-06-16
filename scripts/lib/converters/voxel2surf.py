@@ -3,7 +3,7 @@
 Backward-compatible CLI entry for staged voxel2surf.
 
     python scripts/lib/converters/voxel2surf.py --index 10
-    python scripts/lib/converters/voxel2surf.py --index 119 --recipe v3_taubin
+    python scripts/lib/converters/voxel2surf.py --index 119 --recipe pyvista_taubin
     python scripts/lib/converters/voxel2surf.py --index 119 --run-dir output/surfaces/runs/test
 """
 

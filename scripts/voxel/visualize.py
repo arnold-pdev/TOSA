@@ -10,6 +10,7 @@ Examples:
     conda activate tosa
     python scripts/voxel/visualize.py --index 0 --test
     python scripts/voxel/visualize.py --index 0 --test --with-gradient
+    python scripts/voxel/visualize.py --index 119 --test --with-homology
     python scripts/voxel/visualize.py --index 0 --test --with-gradient --gradient-binary
     # NITO ML design (after voxel/predict.py):
     python scripts/voxel/visualize.py --index 0 --test \\
@@ -46,6 +47,8 @@ from lib.nito_io import (
     resolve_data_dir,
     shape_ndim,
 )
+from lib.converters.voxel2graph.highlight import HomologyHighlight, homology_highlight
+from lib.volume_check import binarize_topology
 
 
 def _default_title(index: int, shape: np.ndarray, vf: float) -> str:
@@ -474,6 +477,31 @@ def topology_mesh_3d(
     return grid.threshold(threshold, scalars="rho")
 
 
+def _label_cell_mesh(
+    shape: np.ndarray,
+    labels: np.ndarray,
+    *,
+    min_label: int = 1,
+) -> pv.UnstructuredGrid:
+    """PyVista cell mesh for integer labels >= ``min_label``."""
+    shape = np.asarray(shape, dtype=int).ravel()
+    arr = np.asarray(labels, dtype=np.int32).reshape(shape, order="C")
+    grid = pv.ImageData(dimensions=np.array(shape) + 1)
+    grid.cell_data["label"] = arr.flatten(order="F")
+    lo = float(min_label) - 0.5
+    return grid.threshold([lo, arr.max() + 0.5], scalars="label")
+
+
+def _homology_title_suffix(highlight: HomologyHighlight) -> str:
+    b = highlight.betti
+    n_tunnel = int(np.count_nonzero(highlight.tunnel_solid))
+    n_cavity = int(np.count_nonzero(highlight.cavity_void))
+    return (
+        f"  Betti: b0={b.b0_graph} ({b.b0_cubical},{b.b1},{b.b2})"
+        f"  tunnel_vox={n_tunnel}  cavity_vox={n_cavity}"
+    )
+
+
 def plot_sample_3d(
     index: int,
     shape: np.ndarray,
@@ -486,6 +514,8 @@ def plot_sample_3d(
     title: str | None = None,
     show: bool = True,
     save_path: Path | None = None,
+    show_homology: bool = False,
+    homology_tunnel_dilation: int = 2,
 ) -> None:
     off_screen = save_path is not None and not show
     solid = topology_mesh_3d(shape, rho, threshold=threshold)
@@ -495,6 +525,16 @@ def plot_sample_3d(
     if title is None:
         title = _default_title(index, shape, vf)
 
+    highlight: HomologyHighlight | None = None
+    if show_homology:
+        vox = binarize_topology(rho, shape, cutoff=threshold)
+        highlight = homology_highlight(
+            vox,
+            threshold=0.5,
+            tunnel_dilation=homology_tunnel_dilation,
+        )
+        title = f"{title}{_homology_title_suffix(highlight)}"
+
     plotter = pv.Plotter(off_screen=off_screen)
     plotter.add_text(title, font_size=10)
     plotter.enable_depth_peeling()
@@ -503,9 +543,42 @@ def plot_sample_3d(
         solid,
         show_edges=True,
         color="tan",
-        opacity=0.45,
+        opacity=0.35 if show_homology else 0.45,
         label=f"Topology (rho >= {threshold})",
     )
+
+    if highlight is not None:
+        n_tunnel_feats = int(highlight.tunnel_solid.max())
+        n_cavity_feats = int(highlight.cavity_void.max())
+        if n_tunnel_feats > 0:
+            tunnel_mesh = _label_cell_mesh(shape, highlight.tunnel_solid)
+            plotter.add_mesh(
+                tunnel_mesh,
+                color="orangered",
+                opacity=0.95,
+                show_edges=True,
+                label=f"Tunnel features (b1={highlight.betti.b1}, n={n_tunnel_feats})",
+            )
+        if n_cavity_feats > 0:
+            cavity_mesh = _label_cell_mesh(shape, highlight.cavity_void)
+            plotter.add_mesh(
+                cavity_mesh,
+                color="cyan",
+                opacity=0.85,
+                show_edges=False,
+                label=f"Enclosed cavities (b2={highlight.betti.b2}, n={n_cavity_feats})",
+            )
+        if n_tunnel_feats == 0 and n_cavity_feats == 0 and (
+            highlight.betti.b1 > 0 or highlight.betti.b2 > 0
+        ):
+            plotter.add_text(
+                "Homology features detected but no local highlight voxels\n"
+                "(tunnels may open to the exterior on this grid)",
+                position="lower_left",
+                font_size=9,
+                color="orange",
+            )
+
     if bc_pts.size:
         plotter.add_mesh(
             pv.PolyData(bc_pts),
@@ -562,10 +635,14 @@ def plot_sample(
     gradient_binary: bool = False,
     gradient_rho_lo: float = 0.01,
     gradient_rho_hi: float = 0.99,
+    show_homology: bool = False,
+    homology_tunnel_dilation: int = 2,
 ) -> None:
     nd = shape_ndim(shape)
     if backend is None:
         backend = "matplotlib" if nd == 2 else "pyvista"
+    if show_homology and nd != 3:
+        raise ValueError("--with-homology is only supported for 3D samples")
     if backend == "matplotlib":
         if nd != 2:
             raise ValueError("Matplotlib backend only supports 2D samples")
@@ -591,6 +668,8 @@ def plot_sample(
         plot_sample_3d(
             index, shape, rho, bc, load, vf,
             threshold=threshold, title=title, show=show, save_path=save_path,
+            show_homology=show_homology,
+            homology_tunnel_dilation=homology_tunnel_dilation,
         )
     else:
         raise ValueError(f"Unknown backend: {backend}")
@@ -679,6 +758,17 @@ def parse_args() -> argparse.Namespace:
         help="Design field for left panel (e.g. output/nito_predictions/<i>/rho_pred.npy); "
         "default: dataset topology or rho.npy from --atoms-results",
     )
+    p.add_argument(
+        "--with-homology",
+        action="store_true",
+        help="Highlight cubical homology tunnels (b1, orange) and enclosed cavities (b2, cyan); 3D only",
+    )
+    p.add_argument(
+        "--homology-tunnel-dilation",
+        type=int,
+        default=2,
+        help="Face-steps to grow tunnel birth voxels for visibility (default 2)",
+    )
     return p.parse_args()
 
 
@@ -741,6 +831,8 @@ def main() -> None:
         gradient_binary=args.gradient_binary,
         gradient_rho_lo=args.gradient_rho_lo,
         gradient_rho_hi=args.gradient_rho_hi,
+        show_homology=args.with_homology,
+        homology_tunnel_dilation=args.homology_tunnel_dilation,
     )
 
 

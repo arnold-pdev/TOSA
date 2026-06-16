@@ -28,7 +28,7 @@ def _load_indices(path: Path) -> list[int]:
 
 def main() -> None:
     p = argparse.ArgumentParser(description="Benchmark voxel2surf on probe indices.")
-    p.add_argument("--recipe", type=str, default="v3_default")
+    p.add_argument("--recipe", type=str, default="pyvista_laplacian")
     p.add_argument("--run-dir", type=Path, required=True)
     p.add_argument(
         "--indices-file",

@@ -238,3 +238,206 @@ def rescale_mesh_volume(
 def mesh_volume_fraction(mesh: trimesh.Trimesh, domain_vol: float) -> float | None:
     """Convenience wrapper around volume_check."""
     return volume_fraction_mesh(mesh, domain_vol)
+
+
+def _world_to_grid(
+    points: np.ndarray,
+    origin: np.ndarray,
+    spacing: np.ndarray,
+    shape: np.ndarray,
+) -> np.ndarray:
+    """Continuous grid coordinates for trilinear sampling."""
+    origin = np.asarray(origin, dtype=float)
+    spacing = np.asarray(spacing, dtype=float)
+    shape = np.asarray(shape, dtype=int)
+    return (np.asarray(points, dtype=float) - origin) / spacing
+
+
+def sample_sdf_at_points(
+    sdf: np.ndarray,
+    points: np.ndarray,
+    origin: np.ndarray,
+    spacing: np.ndarray,
+) -> np.ndarray:
+    """Trilinear sample of a regular-grid SDF at world-space points."""
+    grid = _world_to_grid(points, origin, spacing, np.asarray(sdf.shape))
+    coords = np.column_stack(
+        [
+            np.clip(grid[:, 0], 0, sdf.shape[0] - 1.001),
+            np.clip(grid[:, 1], 0, sdf.shape[1] - 1.001),
+            *(
+                [np.clip(grid[:, 2], 0, sdf.shape[2] - 1.001)]
+                if sdf.ndim == 3
+                else []
+            ),
+        ],
+    )
+    return np.asarray(
+        ndimage.map_coordinates(sdf, coords.T, order=1, mode="nearest"),
+        dtype=float,
+    )
+
+
+def sdf_gradient_at_points(
+    sdf: np.ndarray,
+    points: np.ndarray,
+    origin: np.ndarray,
+    spacing: np.ndarray,
+) -> np.ndarray:
+    """Central-difference SDF gradient at world-space points."""
+    spacing = np.asarray(spacing, dtype=float)
+    eps = 0.25 * spacing
+    grads = []
+    for axis in range(min(3, sdf.ndim)):
+        delta = np.zeros(3, dtype=float)
+        delta[axis] = eps[axis]
+        plus = sample_sdf_at_points(sdf, points + delta, origin, spacing)
+        minus = sample_sdf_at_points(sdf, points - delta, origin, spacing)
+        grads.append((plus - minus) / (2.0 * eps[axis]))
+    g = np.column_stack(grads)
+    norms = np.linalg.norm(g, axis=1, keepdims=True)
+    norms = np.maximum(norms, 1e-12)
+    return g / norms
+
+
+def bc_slab_mask(
+    shape: np.ndarray,
+    patches,
+    *,
+    slab_thickness: int = 1,
+) -> np.ndarray:
+    """Boolean mask of grid cells in BC patch footprints (including slab thickness)."""
+    shape = np.asarray(shape, dtype=int)
+    mask = np.zeros(shape, dtype=bool)
+    ndim = int(shape.size)
+    for patch in patches:
+        if not getattr(patch, "is_bc", True) or not patch.faces:
+            continue
+        axis = patch.axis
+        slab = 0 if patch.side == "min" else shape[axis] - 1
+        inplane = [i for i in range(ndim) if i != axis]
+        for foot in patch.faces:
+            idx = [0] * ndim
+            idx[axis] = slab
+            for k, ax in enumerate(inplane):
+                idx[ax] = int(foot[k])
+            for t in range(slab_thickness):
+                cell = list(idx)
+                if patch.side == "min":
+                    cell[axis] = min(shape[axis] - 1, slab + t)
+                else:
+                    cell[axis] = max(0, slab - t)
+                mask[tuple(cell)] = True
+    return mask
+
+
+def apply_bc_dirichlet_sdf(
+    sdf: np.ndarray,
+    patches,
+    origin: np.ndarray,
+    spacing: np.ndarray,
+    shape: np.ndarray,
+) -> np.ndarray:
+    """
+    Pin SDF values on BC slab cells to signed distance to analytic patch planes.
+
+    Negative inside solid; plane at patch boundary gets sdf ≈ 0 on the cap.
+    """
+    out = np.asarray(sdf, dtype=float).copy()
+    origin = np.asarray(origin, dtype=float)
+    spacing = np.asarray(spacing, dtype=float)
+    shape = np.asarray(shape, dtype=int)
+    ndim = int(shape.size)
+    mask = bc_slab_mask(shape, patches)
+    if not np.any(mask):
+        return out
+
+    coords = np.argwhere(mask).astype(float)
+    for axis in range(ndim):
+        coords[:, axis] = origin[axis] + (coords[:, axis] + 0.5) * spacing[axis]
+
+    for patch in patches:
+        if not patch.is_bc or not patch.faces:
+            continue
+        axis = patch.axis
+        slab = 0 if patch.side == "min" else shape[axis] - 1
+        inplane = [i for i in range(ndim) if i != axis]
+        foot = {tuple(f) for f in patch.faces}
+        for foot_cell in foot:
+            idx = [0] * ndim
+            idx[axis] = slab
+            for k, ax in enumerate(inplane):
+                idx[ax] = int(foot_cell[k])
+            ijk = tuple(idx)
+            if not mask[ijk]:
+                continue
+            pt = origin.copy()
+            for d in range(ndim):
+                pt[d] = origin[d] + (idx[d] + 0.5) * spacing[d]
+            signed = pt[axis] - patch.plane_coord
+            if patch.side == "min":
+                signed = -signed
+            out[ijk] = float(signed)
+    return out
+
+
+def smooth_sdf_masked(
+    sdf: np.ndarray,
+    patches,
+    origin: np.ndarray,
+    spacing: np.ndarray,
+    shape: np.ndarray,
+    *,
+    sigma: float,
+) -> np.ndarray:
+    """Gaussian smooth SDF only off BC slabs; re-apply Dirichlet pin after."""
+    if sigma <= 0:
+        return sdf
+    mask = bc_slab_mask(shape, patches)
+    field = np.asarray(sdf, dtype=float).copy()
+    smoothed = ndimage.gaussian_filter(field, sigma=sigma)
+    if not np.any(mask):
+        return smoothed
+    out = smoothed
+    out[mask] = field[mask]
+    return apply_bc_dirichlet_sdf(out, patches, origin, spacing, shape)
+
+
+def snap_mesh_vertices_to_sdf(
+    mesh: trimesh.Trimesh,
+    sdf: np.ndarray,
+    origin: np.ndarray,
+    spacing: np.ndarray,
+    *,
+    weights: np.ndarray | None = None,
+    iso_level: float = 0.0,
+    steps: int = 3,
+    step_scale: float = 0.5,
+) -> int:
+    """
+    Nudge free vertices toward the SDF iso-surface via gradient descent.
+
+    Returns the number of vertices updated.
+    """
+    if steps <= 0:
+        return 0
+    w = np.zeros(len(mesh.vertices), dtype=float) if weights is None else np.asarray(
+        weights, dtype=float,
+    )
+    free = w < 1.0 - 1e-12
+    if not np.any(free):
+        return 0
+    vids = np.where(free)[0]
+    verts = mesh.vertices.copy()
+    n_updated = 0
+    for _ in range(steps):
+        pts = verts[vids]
+        vals = sample_sdf_at_points(sdf, pts, origin, spacing) - iso_level
+        if np.max(np.abs(vals)) < 1e-6:
+            break
+        grad = sdf_gradient_at_points(sdf, pts, origin, spacing)
+        step = step_scale * vals[:, None] * grad
+        verts[vids] = verts[vids] - step
+        n_updated = int(vids.size)
+    mesh.vertices = verts
+    return n_updated

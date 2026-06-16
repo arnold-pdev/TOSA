@@ -85,9 +85,27 @@ def update_manifest(
     path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
 
 
-_METRICS_FIELDS = list(RunMetrics(index=0, recipe_id="", vf_voxel=0.0, vf_mesh=None,
-    vf_delta=None, vf_nito=None, bc_plane_max_residual=0.0, bc_labeled_triangles=0,
-    load_check_failed=False, vertices=0, faces=0, patches=0).as_csv_row().keys())
+_METRICS_FIELDS = list(
+    RunMetrics(
+        index=0,
+        recipe_id="",
+        vf_voxel=0.0,
+        vf_mesh=None,
+        vf_delta=None,
+        vf_nito=None,
+        bc_plane_max_residual=0.0,
+        bc_labeled_triangles=0,
+        bc_oracle_max_gap=None,
+        bc_min_patch_tris=None,
+        free_dihedral_mean_deg=None,
+        free_dihedral_p95_deg=None,
+        axis_aligned_edge_frac=None,
+        load_check_failed=False,
+        vertices=0,
+        faces=0,
+        patches=0,
+    ).as_csv_row().keys(),
+)
 
 
 def append_metrics_csv(run_dir: Path, metrics: RunMetrics) -> None:

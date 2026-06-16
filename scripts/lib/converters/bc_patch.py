@@ -382,6 +382,129 @@ def build_load_patches(load_rows: np.ndarray, shape: np.ndarray) -> list[Patch]:
     return patches
 
 
+def plane_offset_band(
+    patch: Patch,
+    origin,
+    spacing,
+    vox: np.ndarray,
+) -> tuple[float, float]:
+    """
+    Admissible plane offset band from BC voxel support on the patch slab.
+
+    For axis-aligned NITO BC the band usually collapses to ``plane_coord``.
+    """
+    origin = np.asarray(origin, dtype=float)
+    spacing = np.asarray(spacing, dtype=float)
+    solid = np.asarray(vox) > 0
+    shape = solid.shape
+    ndim = len(shape)
+    if not patch.faces:
+        return patch.plane_coord, patch.plane_coord
+    axis = patch.axis
+    slab = 0 if patch.side == "min" else shape[axis] - 1
+    inplane = [i for i in range(ndim) if i != axis]
+    dists: list[float] = []
+    for foot in patch.faces:
+        idx = [0] * ndim
+        idx[axis] = slab
+        for k, ax in enumerate(inplane):
+            idx[ax] = int(foot[k])
+        if not solid[tuple(idx)]:
+            continue
+        pt = origin.copy()
+        for d in range(ndim):
+            pt[d] = origin[d] + (idx[d] + 0.5) * spacing[d]
+        dists.append(float(pt[axis]))
+    if not dists:
+        return patch.plane_coord, patch.plane_coord
+    return float(min(dists)), float(max(dists))
+
+
+def cuberille_bc_quads(
+    patches: list[Patch],
+    origin,
+    spacing,
+) -> trimesh.Trimesh:
+    """
+    One axis-aligned quad per footprint cell on each BC patch plane.
+
+    Quads are triangulated for downstream Trimesh use.
+    """
+    origin = np.asarray(origin, dtype=float)
+    spacing = np.asarray(spacing, dtype=float)
+    verts: list[np.ndarray] = []
+    faces: list[list[int]] = []
+    voff = 0
+    for patch in patches:
+        if not patch.is_bc or not patch.faces:
+            continue
+        axis = patch.axis
+        ndim = 3
+        inplane = [i for i in range(ndim) if i != axis]
+        for foot in patch.faces:
+            lo = origin.copy()
+            hi = origin.copy()
+            for k, ax in enumerate(inplane):
+                lo[ax] = origin[ax] + int(foot[k]) * spacing[ax]
+                hi[ax] = origin[ax] + (int(foot[k]) + 1) * spacing[ax]
+            lo[axis] = hi[axis] = patch.plane_coord
+            c00 = lo.copy()
+            c10 = lo.copy()
+            c10[inplane[0]] = hi[inplane[0]]
+            c11 = hi.copy()
+            c01 = lo.copy()
+            c01[inplane[1]] = hi[inplane[1]]
+            quad = np.array([c00, c10, c11, c01], dtype=float)
+            verts.extend(quad)
+            faces.append([voff, voff + 1, voff + 2])
+            faces.append([voff, voff + 2, voff + 3])
+            voff += 4
+    if not verts:
+        return trimesh.Trimesh(
+            vertices=np.zeros((0, 3), dtype=float),
+            faces=np.zeros((0, 3), dtype=np.int64),
+            process=False,
+        )
+    return trimesh.Trimesh(
+        vertices=np.asarray(verts, dtype=float),
+        faces=np.asarray(faces, dtype=np.int64),
+        process=False,
+    )
+
+
+def compare_mesh_to_bc_oracle(
+    mesh: trimesh.Trimesh,
+    tri_labels: np.ndarray,
+    oracle: trimesh.Trimesh,
+    patches: list[Patch],
+) -> dict[str, float]:
+    """
+    Max point-to-triangle gap between labeled BC mesh triangles and cuberille oracle.
+    """
+    from trimesh.proximity import closest_point
+
+    bc_centroids = []
+    for pid, patch in enumerate(patches):
+        if not patch.is_bc:
+            continue
+        mask = np.asarray(tri_labels, dtype=int) == pid
+        if not np.any(mask):
+            continue
+        bc_centroids.append(mesh.triangles_center[mask])
+    if not bc_centroids or oracle.faces.size == 0:
+        return {"bc_oracle_max_gap": 0.0, "bc_oracle_mean_gap": 0.0}
+    pts = np.vstack(bc_centroids)
+    try:
+        closest, dist, _ = closest_point(oracle, pts)
+    except ModuleNotFoundError:
+        return {"bc_oracle_max_gap": float("nan"), "bc_oracle_mean_gap": float("nan")}
+    _ = closest
+    return {
+        "bc_oracle_max_gap": float(np.max(dist)),
+        "bc_oracle_mean_gap": float(np.mean(dist)),
+    }
+
+
 def project_point_to_mesh(
     mesh: trimesh.Trimesh,
     point: np.ndarray,

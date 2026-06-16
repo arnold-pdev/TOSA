@@ -31,16 +31,39 @@ class PipelineOptions:
     laplacian_relaxation: float = 0.5
     taubin_iters: int = 10
     taubin_lambda: float = 0.5
-    taubin_nu: float = 0.53
+    taubin_k_pb: float = 0.1  # Taubin pass-band frequency; μ derived from λ and k_PB
+    taubin_mu: float | None = None  # explicit signed μ (<0); overrides taubin_k_pb
     constrain_bc_planes: bool = True
     laplacian_freeze_rings: int = 0
     calibrate_vf: bool = False
     field_smooth_sigma: float = 0.0
+    field_bc_mask: bool = False
+    upsample_factor: int = 1
+    snap_to_sdf: bool = False
+    snap_to_sdf_steps: int = 3
     load_surface_tol_cells: float = 1.0
     vf_tol_cells: float = 2.0
     check_loads: bool = True
     on_load_fail: LoadCheckPolicy = "raise"
+    bc_plane_tol: float = 1e-5
+    on_bc_fail: LoadCheckPolicy = "raise"
+    bc_claim_coplanar: bool = True
+    bc_planar_cap: bool = False
+    bc_planar_cap_method: str = "upsample_blur"
+    bc_planar_cap_upsample: int = 4
+    bc_planar_cap_blur_sigma: float = 1.0
+    bc_planar_cap_outward_buffer: float = 0.25
     bc_strict_footprint: bool = False
+    bc_transfer: str = "centroid"
+    bc_transfer_band_cells: float = 1.0
+    bc_regrow: str = "none"
+    bc_oracle: bool = False
+    bc_assembly: str = "monolithic"  # monolithic | shared_seam
+    smooth_free_only: bool = False
+    subdivide_free_only: bool = False
+    hc_iters: int = 10
+    hc_lambda: float = 0.5
+    hc_alpha: float = 0.1
 
 
 @dataclass
@@ -54,10 +77,13 @@ class SurfaceState:
     spacing: np.ndarray
     specs: list[BCSpec] = field(default_factory=list)
     patches: list[Patch] = field(default_factory=list)
+    bc_mesh: trimesh.Trimesh | None = None
     tri_labels: np.ndarray | None = None
+    tri_labels_voxel: np.ndarray | None = None
     freeze: np.ndarray | None = None
     stage_reports: list[PipelineStageReport] = field(default_factory=list)
     bc_audit: dict[str, float] = field(default_factory=dict)
+    stage_timings: dict[str, float] = field(default_factory=dict)
     load_checks: list[LoadSurfaceCheck] = field(default_factory=list)
     load_check_failed: bool = False
     extract_meta: dict[str, float] = field(default_factory=dict)
@@ -112,6 +138,11 @@ class RunMetrics:
     vertices: int
     faces: int
     patches: int
+    bc_oracle_max_gap: float | None = None
+    bc_min_patch_tris: int | None = None
+    free_dihedral_mean_deg: float | None = None
+    free_dihedral_p95_deg: float | None = None
+    axis_aligned_edge_frac: float | None = None
 
     def as_csv_row(self) -> dict[str, str | int | float]:
         return {
@@ -123,6 +154,21 @@ class RunMetrics:
             "vf_nito": "" if self.vf_nito is None else self.vf_nito,
             "bc_plane_max_residual": self.bc_plane_max_residual,
             "bc_labeled_triangles": self.bc_labeled_triangles,
+            "bc_oracle_max_gap": (
+                "" if self.bc_oracle_max_gap is None else self.bc_oracle_max_gap
+            ),
+            "bc_min_patch_tris": (
+                "" if self.bc_min_patch_tris is None else self.bc_min_patch_tris
+            ),
+            "free_dihedral_mean_deg": (
+                "" if self.free_dihedral_mean_deg is None else self.free_dihedral_mean_deg
+            ),
+            "free_dihedral_p95_deg": (
+                "" if self.free_dihedral_p95_deg is None else self.free_dihedral_p95_deg
+            ),
+            "axis_aligned_edge_frac": (
+                "" if self.axis_aligned_edge_frac is None else self.axis_aligned_edge_frac
+            ),
             "load_check_failed": int(self.load_check_failed),
             "vertices": self.vertices,
             "faces": self.faces,

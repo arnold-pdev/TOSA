@@ -2,7 +2,7 @@
 
 from lib.converters.voxel2surf.pipeline import save_surface, voxel_to_surface
 from lib.converters.voxel2surf.recipes import get_recipe, list_recipes
-from lib.converters.voxel2surf.stages.bc_transfer import transfer_patches
+from lib.converters.voxel2surf.bc_transfer import transfer_patches
 from lib.converters.voxel2surf.types import (
     PipelineOptions,
     SurfaceOutputFormat,

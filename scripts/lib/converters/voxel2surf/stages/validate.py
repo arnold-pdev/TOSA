@@ -7,6 +7,7 @@ import warnings
 import numpy as np
 
 from lib.converters.voxel2surf.types import PipelineContext, SurfaceState
+from lib.meshing.smoothness_metrics import free_boundary_smoothness
 from lib.nito_physics import (
     failed_load_surface_checks,
     format_load_surface_failure,
@@ -76,11 +77,35 @@ def run_validate(state: SurfaceState, ctx: PipelineContext) -> None:
             f"(tol={ctx.options.vf_tol_cells:g} cells)",
         )
 
-    if state.bc_audit.get("bc_plane_max_residual", 0.0) > 1e-5:
+    if state.bc_audit.get("bc_plane_max_residual", 0.0) > ctx.options.bc_plane_tol + 1e-12:
         ctx.log(
             "        BC plane residual WARN: "
-            f"{state.bc_audit['bc_plane_max_residual']:.3g}",
+            f"{state.bc_audit['bc_plane_max_residual']:.3g} "
+            f"(tol={ctx.options.bc_plane_tol:.3g})",
         )
+
+    min_patch = state.bc_audit.get("bc_min_patch_tris")
+    if min_patch is not None:
+        ctx.log(f"        bc_min_patch_tris={int(min_patch)}")
+        if min_patch == 0 and state.patches:
+            ctx.log("        BC patch WARN: at least one patch has 0 labeled triangles")
+
+    if state.bc_audit.get("bc_oracle_max_gap", 0.0) > 0.1:
+        ctx.log(
+            "        BC oracle gap WARN: "
+            f"{state.bc_audit['bc_oracle_max_gap']:.3g}",
+        )
+
+    if state.tri_labels is not None:
+        smooth = free_boundary_smoothness(state.mesh, state.tri_labels)
+        state.bc_audit.update(smooth)
+        if not np.isnan(smooth["free_dihedral_mean_deg"]):
+            ctx.log(
+                "        free boundary smoothness: "
+                f"dihedral_mean={smooth['free_dihedral_mean_deg']:.2f}° "
+                f"p95={smooth['free_dihedral_p95_deg']:.2f}° "
+                f"axis_aligned_edges={smooth['axis_aligned_edge_frac']:.1%}",
+            )
 
     has_loads = (
         ctx.options.check_loads

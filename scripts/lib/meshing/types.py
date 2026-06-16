@@ -10,6 +10,7 @@ from pathlib import Path
 class MeshBackend(str, Enum):
     GMSH = "gmsh"
     TETGEN = "tetgen"
+    VOXEL_HEX = "voxel_hex"
 
 
 @dataclass(frozen=True)

@@ -1,0 +1,42 @@
+{
+  "id": "compatible-pipelines-v1",
+  "description": "Comparable voxel2surf recipes on index 119 for BC, VF, and free-boundary smoothness QA.",
+  "indices_file": "batch/validation_indices.txt",
+  "recipes": [
+    {
+      "cli": "extract_baseline",
+      "tag": "baseline",
+      "role": "Stairstep baseline (no smooth)"
+    },
+    {
+      "cli": "pyvista_laplacian",
+      "tag": "laplacian",
+      "role": "Laplacian + BC pin"
+    },
+    {
+      "cli": "pyvista_taubin",
+      "tag": "taubin",
+      "role": "Primary candidate"
+    },
+    {
+      "cli": "pyvista_taubin_regrow",
+      "tag": "regrow",
+      "role": "BC regrow + Taubin"
+    },
+    {
+      "cli": "pyvista_hc",
+      "tag": "hc",
+      "role": "HC smooth"
+    },
+    {
+      "cli": "sdf_lewiner_calibrated",
+      "tag": "sdf-vf",
+      "role": "SDF + VF calibrate"
+    },
+    {
+      "cli": "sdf_masked_taubin",
+      "tag": "sdf-masked",
+      "role": "BC-masked SDF"
+    }
+  ]
+}

@@ -20,6 +20,8 @@ output/figures/*
 # --- Surface pipeline experiment runs ---
 output/surfaces/runs/*
 !output/surfaces/runs/.gitkeep
+output/surfaces/validation/*
+!output/surfaces/validation/.gitkeep
 
 # --- Surface meshes (VTP distribution; legacy STL cache) ---
 public/vtp/

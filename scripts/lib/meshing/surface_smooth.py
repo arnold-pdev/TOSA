@@ -210,6 +210,7 @@ def constrained_laplacian_smooth(
     iterations: int = 0,
     relaxation: float = 0.3,
     constrain_bc_planes: bool = True,
+    smooth_free_only: bool = False,
 ) -> tuple[int, int]:
     """
     Laplacian smooth with frozen vertices; optional BC plane projection each iter.
@@ -231,19 +232,32 @@ def constrained_laplacian_smooth(
     n_frozen = int(np.count_nonzero(vmap >= 0))
 
     L = _uniform_laplacian(mesh)
-    w = np.asarray(weights, dtype=float)[:, None]
+    w = _apply_free_only_mask(weights, mesh, tri_labels, smooth_free_only=smooth_free_only)
     free = 1.0 - w
     alpha = float(relaxation)
     v = mesh.vertices.copy()
     for _ in range(iterations):
         lap = L.dot(v) - v
-        v = v + alpha * lap * free
+        v = v + alpha * lap * free[:, None]
         mesh.vertices = v
         if constrain_bc_planes and n_bc:
             _project_bc_vertices(mesh, vmap, patches)
             v = mesh.vertices.copy()
 
     return n_bc_tris, n_frozen
+
+
+def taubin_mu_from_passband(lamb: float, k_pb: float) -> float:
+    """
+    Signed μ from Taubin's non-shrinking pass-band relation ``1/λ + 1/μ = k_PB``.
+
+    Taubin (SIGGRAPH '95): choose λ and the pass-band frequency ``k_PB``; then
+    ``μ = λ / (λ·k_PB − 1) < 0``. The canonical λ=0.5, k_PB=0.1 ⇒ μ ≈ −0.526.
+    """
+    denom = float(lamb) * float(k_pb) - 1.0
+    if abs(denom) < 1e-12:
+        return -float(lamb)
+    return float(lamb) / denom
 
 
 def masked_taubin_smooth(
@@ -254,11 +268,15 @@ def masked_taubin_smooth(
     *,
     iterations: int = 10,
     lamb: float = 0.5,
-    nu: float = 0.53,
+    mu: float = -0.53,
     constrain_bc_planes: bool = True,
+    smooth_free_only: bool = False,
 ) -> tuple[int, int]:
     """
     Taubin λ|μ smooth with frozen vertices; optional BC plane projection each iter.
+
+    ``mu`` is the signed second-pass coefficient (μ < 0); derive it from a
+    pass-band frequency with :func:`taubin_mu_from_passband`.
 
     Returns ``(n_bc_triangles, n_frozen_vertices)`` when BC patches exist.
     """
@@ -273,13 +291,13 @@ def masked_taubin_smooth(
     n_frozen = int(np.count_nonzero(vmap >= 0))
 
     L = _uniform_laplacian(mesh)
-    w = np.asarray(weights, dtype=float)[:, None]
+    w = _apply_free_only_mask(weights, mesh, tri_labels, smooth_free_only=smooth_free_only)
     free = 1.0 - w
     v = mesh.vertices.copy()
     for _ in range(iterations):
-        for factor in (float(lamb), -float(nu)):
+        for factor in (float(lamb), float(mu)):
             lap = L.dot(v) - v
-            v = v + factor * lap * free
+            v = v + factor * lap * free[:, None]
         mesh.vertices = v
         if constrain_bc_planes and n_bc:
             _project_bc_vertices(mesh, vmap, patches)
@@ -321,3 +339,210 @@ def flatten_bc_planes(
         vids = np.where(vmap == pid)[0]
         if vids.size:
             mesh.vertices[vids, patch.axis] = patch.plane_coord
+
+
+def free_triangle_vertex_mask(
+    mesh: trimesh.Trimesh,
+    tri_labels: np.ndarray,
+) -> np.ndarray:
+    """True for vertices incident only to free (unlabeled) triangles."""
+    labels = np.asarray(tri_labels, dtype=int)
+    n = len(mesh.vertices)
+    on_bc = np.zeros(n, dtype=bool)
+    on_free = np.zeros(n, dtype=bool)
+    for fidx, face in enumerate(mesh.faces):
+        if labels[fidx] >= 0:
+            on_bc[face] = True
+        else:
+            on_free[face] = True
+    return on_free & ~on_bc
+
+
+def subdivide_mesh_free_only(
+    mesh: trimesh.Trimesh,
+    tri_labels: np.ndarray,
+    levels: int = 1,
+) -> tuple[trimesh.Trimesh, np.ndarray]:
+    """Subdivide only free-boundary triangles; BC labels preserved on untouched tris."""
+    if levels <= 0:
+        return mesh, np.asarray(tri_labels, dtype=np.int32)
+    labels = np.asarray(tri_labels, dtype=np.int32)
+    free_mask = labels < 0
+    if not np.any(free_mask):
+        return subdivide_mesh(mesh, levels), labels
+
+    import pyvista as pv
+
+    free_faces = mesh.faces[free_mask]
+    free_vids = np.unique(free_faces.ravel())
+    remap = {int(v): i for i, v in enumerate(free_vids)}
+    sub_verts = mesh.vertices[free_vids]
+    sub_faces = np.array(
+        [[remap[int(v)] for v in face] for face in free_faces],
+        dtype=np.int64,
+    )
+    faces_pv = np.column_stack(
+        [np.full(len(sub_faces), 3, dtype=np.int64), sub_faces.astype(np.int64)],
+    ).ravel()
+    poly = pv.PolyData(sub_verts, faces_pv)
+    for _ in range(levels):
+        poly = poly.subdivide(1, subfilter="linear")
+    new_free_faces = poly.faces.reshape(-1, 4)[:, 1:4]
+    free_mesh = trimesh.Trimesh(
+        vertices=np.asarray(poly.points, dtype=float),
+        faces=np.asarray(new_free_faces, dtype=np.int64),
+        process=False,
+    )
+
+    bc_mesh = trimesh.Trimesh(
+        vertices=mesh.vertices.copy(),
+        faces=mesh.faces[~free_mask],
+        process=False,
+    )
+    stitched, new_labels = _concat_meshes_with_labels(
+        bc_mesh,
+        labels[~free_mask],
+        free_mesh,
+        np.full(len(free_mesh.faces), -1, dtype=np.int32),
+    )
+    return stitched, new_labels
+
+
+def _concat_meshes_with_labels(
+    mesh_a: trimesh.Trimesh,
+    labels_a: np.ndarray,
+    mesh_b: trimesh.Trimesh,
+    labels_b: np.ndarray,
+) -> tuple[trimesh.Trimesh, np.ndarray]:
+    voff = len(mesh_a.vertices)
+    verts = np.vstack([mesh_a.vertices, mesh_b.vertices])
+    faces = np.vstack([mesh_a.faces, mesh_b.faces + voff])
+    labels = np.concatenate([labels_a, labels_b]).astype(np.int32)
+    return trimesh.Trimesh(vertices=verts, faces=faces, process=False), labels
+
+
+def _apply_free_only_mask(
+    weights: np.ndarray,
+    mesh: trimesh.Trimesh,
+    tri_labels: np.ndarray,
+    *,
+    smooth_free_only: bool,
+) -> np.ndarray:
+    if not smooth_free_only:
+        return weights
+    w = np.asarray(weights, dtype=float).copy()
+    free_verts = free_triangle_vertex_mask(mesh, tri_labels)
+    w[free_verts] = 0.0
+    return w
+
+
+def masked_hc_smooth(
+    mesh: trimesh.Trimesh,
+    weights: np.ndarray,
+    patches: list[Patch],
+    tri_labels: np.ndarray,
+    *,
+    iterations: int = 10,
+    lamb: float = 0.5,
+    alpha: float = 0.1,
+    constrain_bc_planes: bool = True,
+    smooth_free_only: bool = False,
+) -> tuple[int, int]:
+    """
+    Humphrey-Carlson smooth with frozen vertices and optional BC plane projection.
+
+    Returns ``(n_bc_triangles, n_frozen_vertices)``.
+    """
+    if iterations <= 0:
+        return 0, 0
+
+    n_bc = sum(1 for p in patches if p.is_bc)
+    vmap = bc_patch_vertex_map(mesh, tri_labels, n_bc) if n_bc else np.full(
+        len(mesh.vertices), -1, dtype=int,
+    )
+    n_bc_tris = int(np.count_nonzero(np.asarray(tri_labels) >= 0)) if n_bc else 0
+    n_frozen = int(np.count_nonzero(vmap >= 0))
+
+    L = _uniform_laplacian(mesh)
+    w = _apply_free_only_mask(weights, mesh, tri_labels, smooth_free_only=smooth_free_only)
+    free = (1.0 - w)[:, None]
+    beta = lamb / max(1.0 - lamb, 1e-6) - alpha
+    v = mesh.vertices.copy()
+    for _ in range(iterations):
+        lap = L.dot(v) - v
+        v = v + float(lamb) * lap * free
+        lap2 = L.dot(v) - v
+        v = v - float(beta) * lap2 * free
+        mesh.vertices = v
+        if constrain_bc_planes and n_bc:
+            _project_bc_vertices(mesh, vmap, patches)
+            v = mesh.vertices.copy()
+
+    return n_bc_tris, n_frozen
+
+
+def tangential_taubin_smooth(
+    mesh: trimesh.Trimesh,
+    weights: np.ndarray,
+    patches: list[Patch],
+    tri_labels: np.ndarray,
+    *,
+    iterations: int = 10,
+    lamb: float = 0.5,
+    mu: float = -0.53,
+    constrain_bc_planes: bool = True,
+    smooth_free_only: bool = False,
+) -> tuple[int, int]:
+    """
+    Taubin smooth with Laplacian steps projected to the local tangent plane.
+
+    Pair with ``sdf_field_smooth`` extraction to smooth the skin without strong
+    normal shrinkage (critique proposal c).
+    """
+    if iterations <= 0:
+        return 0, 0
+
+    n_bc = sum(1 for p in patches if p.is_bc)
+    vmap = bc_patch_vertex_map(mesh, tri_labels, n_bc) if n_bc else np.full(
+        len(mesh.vertices), -1, dtype=int,
+    )
+    n_bc_tris = int(np.count_nonzero(np.asarray(tri_labels) >= 0)) if n_bc else 0
+    n_frozen = int(np.count_nonzero(vmap >= 0))
+
+    L = _uniform_laplacian(mesh)
+    w = _apply_free_only_mask(weights, mesh, tri_labels, smooth_free_only=smooth_free_only)
+    free = 1.0 - w
+    v = mesh.vertices.copy()
+    _ = mesh.vertex_normals
+
+    def _tangential_step(coords: np.ndarray, step: float) -> np.ndarray:
+        lap = L.dot(coords) - coords
+        out = coords.copy()
+        for vid in range(len(coords)):
+            if free[vid] < 0.5:
+                continue
+            n_hat = mesh.vertex_normals[vid]
+            n_len = float(np.linalg.norm(n_hat))
+            if n_len < 1e-12:
+                out[vid] = coords[vid] + step * lap[vid]
+                continue
+            n_hat = n_hat / n_len
+            tan = lap[vid] - float(lap[vid] @ n_hat) * n_hat
+            out[vid] = coords[vid] + step * tan
+        return out
+
+    for _ in range(iterations):
+        v = _tangential_step(v, float(lamb))
+        mesh.vertices = v
+        if constrain_bc_planes and n_bc:
+            _project_bc_vertices(mesh, vmap, patches)
+            v = mesh.vertices.copy()
+        _ = mesh.vertex_normals
+        v = _tangential_step(v, float(mu))
+        mesh.vertices = v
+        if constrain_bc_planes and n_bc:
+            _project_bc_vertices(mesh, vmap, patches)
+            v = mesh.vertices.copy()
+        _ = mesh.vertex_normals
+
+    return n_bc_tris, n_frozen

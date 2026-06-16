@@ -2,11 +2,20 @@
 
 from __future__ import annotations
 
-from lib.converters.voxel2surf.stages.bc_build import run_bc_build
-from lib.converters.voxel2surf.stages.bc_enforce import run_bc_enforce, run_bc_transfer
+from lib.converters.voxel2surf.stages.bc_assembly import run_bc_assembly
+from lib.converters.voxel2surf.stages.bc import (
+    run_bc_build,
+    run_bc_enforce,
+    run_bc_planar_cap,
+    run_bc_transfer,
+)
 from lib.converters.voxel2surf.stages.extract import run_extract
-from lib.converters.voxel2surf.stages.smooth import run_smooth
-from lib.converters.voxel2surf.stages.subdivide import run_subdivide
+from lib.converters.voxel2surf.stages.refine import (
+    run_bc_regrow,
+    run_smooth,
+    run_snap,
+    run_subdivide,
+)
 from lib.converters.voxel2surf.stages.validate import run_validate
 
 STAGE_RUNNERS = {
@@ -14,8 +23,12 @@ STAGE_RUNNERS = {
     "bc_build": run_bc_build,
     "bc_transfer": run_bc_transfer,
     "bc_enforce": run_bc_enforce,
+    "bc_assembly": run_bc_assembly,
+    "bc_planar_cap": run_bc_planar_cap,
+    "bc_regrow": run_bc_regrow,
     "subdivide": run_subdivide,
     "smooth": run_smooth,
+    "snap": run_snap,
     "validate": run_validate,
 }
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from collections.abc import Callable
 
 import numpy as np
@@ -29,6 +30,22 @@ def _noop_log(_msg: str) -> None:
 def _apply_recipe_defaults(opts: PipelineOptions, recipe: Recipe) -> PipelineOptions:
     opts.extractor = recipe.extractor
     opts.smoother = recipe.smoother
+    opts.bc_assembly = recipe.bc_assembly
+    if "bc_planar_cap" in recipe.stages:
+        opts.bc_planar_cap = True
+    if recipe.id == "sdf-lewiner-calibrated-taubin":
+        opts.calibrate_vf = True
+    if recipe.id == "sdf-masked-taubin":
+        opts.field_bc_mask = True
+    if recipe.id == "sdf-field-smooth-taubin":
+        opts.calibrate_vf = True
+        if opts.field_smooth_sigma <= 0:
+            opts.field_smooth_sigma = 0.35
+    if recipe.id == "pyvista-taubin-regrow":
+        opts.bc_regrow = "geodesic"
+    if recipe.id == "sdf-lewiner-snap-taubin":
+        opts.calibrate_vf = True
+        opts.snap_to_sdf = True
     return opts
 
 
@@ -37,8 +54,16 @@ def run_pipeline(
     ctx: PipelineContext,
     recipe: Recipe,
 ) -> SurfaceState:
+    t_total = time.perf_counter()
     for stage in recipe.stages:
+        t0 = time.perf_counter()
         run_stage(stage, state, ctx)
+        elapsed = time.perf_counter() - t0
+        state.stage_timings[stage] = elapsed
+        ctx.log(f"        [{stage}] elapsed={elapsed:.3f}s")
+    state.bc_audit["construction_sec"] = time.perf_counter() - t_total
+    for stage, elapsed in state.stage_timings.items():
+        state.bc_audit[f"timing_{stage}_sec"] = elapsed
     return state
 
 
@@ -52,7 +77,7 @@ def voxel_to_surface(
     origin=(0.0, 0.0, 0.0),
     spacing=(1.0, 1.0, 1.0),
     options: PipelineOptions | None = None,
-    recipe: str | Recipe = "v3_default",
+    recipe: str | Recipe = "pyvista_laplacian",
     log: LogFn | None = None,
     **kwargs,
 ) -> SurfaceResult:
@@ -91,10 +116,10 @@ def voxel_to_surface(
     log_fn(f"voxel2surf  recipe={recipe_obj.id}")
     log_fn(
         f"  extract={opts.extractor} smooth={opts.smoother} "
-        f"iso={opts.iso_level}",
+        f"iso={opts.iso_level} bc_assembly={opts.bc_assembly} "
+        f"bc_planar_cap={opts.bc_planar_cap}",
     )
 
-    # Bootstrap mesh placeholder; extract stage replaces it.
     placeholder = trimesh.Trimesh(
         vertices=np.zeros((0, 3), dtype=float),
         faces=np.zeros((0, 3), dtype=np.int64),

@@ -22,6 +22,9 @@ dependencies:
   # voxel2surf: marching-cubes surface + optional watertight repair
   - trimesh>=4.0
   - pymeshfix>=0.16
+  - shapely>=2.0
+  # voxel2graph: cubical homology (b₁, b₂)
+  - gudhi>=3.9
   # ATOMS: sparse Cholesky (hard import in solver.py)
   - scikit-sparse>=0.4.12
   - suitesparse
@@ -37,6 +40,7 @@ dependencies:
   - pip:
       # NITO inference
       - torch>=2.0,<3
+      - torch-geometric>=2.5
       # FEA meshing (Gmsh SDK wheel; TetGen via PyVista/tetgen)
       - gmsh>=4.12,<5
       - tetgen>=0.8,<0.9
