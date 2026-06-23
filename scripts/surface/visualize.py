@@ -307,7 +307,7 @@ def _add_marker_spheres(
     )
 
 
-_TOGGLE_HELP = "Keys: [v] voxels+BC  [s] surface  [l] loads"
+_TOGGLE_HELP = "Keys: [v] voxels+BC  [s] surface  [t] tri skeleton  [l] loads"
 
 
 def _register_layer_toggles(
@@ -327,6 +327,7 @@ def _register_layer_toggles(
 
     plotter.add_key_event("v", lambda: _toggle("voxels"))
     plotter.add_key_event("s", lambda: _toggle("surface"))
+    plotter.add_key_event("t", lambda: _toggle("tri_skeleton"))
     plotter.add_key_event("l", lambda: _toggle("loads"))
     plotter.add_text(
         _TOGGLE_HELP,
@@ -354,13 +355,23 @@ def plot_surface(
     load_points: np.ndarray | None = None,
     marker_radius: float = 1.0,
     bc_face_opacity: float = 0.9,
+    tri_skeleton_mesh: pv.PolyData | None = None,
+    tri_skeleton_scalar: str | None = None,
+    tri_skeleton_labels: list[str] | None = None,
+    tri_skeleton_opacity: float = 0.95,
+    tri_skeleton_line_width: float = 2.0,
 ) -> None:
     mesh = mesh.compute_normals(cell_normals=False, inplace=False)
 
     off_screen = save_path is not None and not show
     plotter = pv.Plotter(off_screen=off_screen)
     plotter.set_background("white")
-    layers: dict[str, list] = {"voxels": [], "surface": [], "loads": []}
+    layers: dict[str, list] = {
+        "voxels": [],
+        "surface": [],
+        "tri_skeleton": [],
+        "loads": [],
+    }
 
     if voxel_overlay is not None:
         layers["voxels"].append(
@@ -405,6 +416,24 @@ def plot_surface(
 
     layers["surface"].append(plotter.add_mesh(mesh, **kwargs))
 
+    if tri_skeleton_mesh is not None and tri_skeleton_scalar:
+        n_labels = len(tri_skeleton_labels or [])
+        layers["tri_skeleton"].append(
+            plotter.add_mesh(
+                tri_skeleton_mesh,
+                scalars=tri_skeleton_scalar,
+                preference="cell",
+                style="wireframe",
+                cmap=patch_categorical_cmap(n_labels),
+                clim=[-0.5, max(n_labels - 0.5, 0.5)],
+                show_scalar_bar=False,
+                line_width=tri_skeleton_line_width,
+                opacity=tri_skeleton_opacity,
+                render_lines_as_tubes=True,
+                label="tri skeleton",
+            )
+        )
+
     if load_points is not None:
         actor = _add_marker_spheres(
             plotter,
@@ -416,17 +445,35 @@ def plot_surface(
         if actor is not None:
             layers["loads"].append(actor)
 
-    if (bc_faces and len(bc_faces)) or (
-        load_points is not None and load_points.size
+    if (
+        tri_skeleton_mesh is not None
+        or (bc_faces and len(bc_faces))
+        or (load_points is not None and load_points.size)
     ):
         plotter.add_legend()
 
     plotter.add_axes()
     plotter.add_text(title, position="upper_left", font_size=10, color="black")
 
+    legend_blocks: list[str] = []
     if categorical and legend_labels:
-        legend = "\n".join(f"{i}: {label}" for i, label in enumerate(legend_labels))
-        plotter.add_text(legend, position="lower_left", font_size=8, color="black")
+        legend_blocks.append(
+            "\n".join(f"{i}: {label}" for i, label in enumerate(legend_labels))
+        )
+    if tri_skeleton_labels and (
+        not categorical or tri_skeleton_labels != legend_labels
+    ):
+        legend_blocks.append(
+            "tri skeleton:\n"
+            + "\n".join(f"{i}: {label}" for i, label in enumerate(tri_skeleton_labels))
+        )
+    if legend_blocks:
+        plotter.add_text(
+            "\n\n".join(legend_blocks),
+            position="lower_left",
+            font_size=8,
+            color="black",
+        )
 
     interactive = show and not off_screen
     if interactive:
@@ -464,7 +511,7 @@ def _resolve_boundary_display(
         raise ValueError(
             f"{path} has no cell_data[{PATCH_ID_KEY!r}]. "
             "Run voxel2surf to produce a tagged VTK surface, e.g.\n"
-            "  python scripts/lib/converters/voxel2surf.py --index N -o out/N.vtp"
+            "  PYTHONPATH=scripts python -m lib.converters.voxel2surf.cli --index N -o out/N.vtp"
         )
 
     if n_bc > 0:
@@ -487,6 +534,27 @@ def _resolve_boundary_display(
 
     mesh, scalar_name, labels = prepare_patch_display(tags, order=order)
     return mesh, scalar_name, labels, True
+
+
+def _resolve_tri_skeleton_display(
+    path: Path,
+    *,
+    n_bc: int = 0,
+) -> tuple[pv.PolyData, str, list[str]]:
+    """Wireframe overlay colored with the same BC patch palette as boundary mode."""
+    tags = try_read_surface_tags(path)
+    if tags is None:
+        raise ValueError(
+            f"{path} has no cell_data[{PATCH_ID_KEY!r}]. "
+            "--tri-skeleton requires a tagged voxel2surf VTK surface."
+        )
+
+    if n_bc > 0:
+        order = merge_patch_display_order(tags.patch_id, n_bc=n_bc)
+    else:
+        order = patch_display_order(tags.patch_id)
+    mesh, scalar_name, labels = prepare_patch_display(tags, order=order)
+    return mesh, scalar_name, labels
 
 
 def parse_args() -> argparse.Namespace:
@@ -524,6 +592,23 @@ def parse_args() -> argparse.Namespace:
         "--list-scalars",
         action="store_true",
         help="Print point_data and cell_data array names and exit",
+    )
+    p.add_argument(
+        "--tri-skeleton",
+        action="store_true",
+        help="Overlay the triangle wireframe colored by BC patch_id (requires tagged .vtp)",
+    )
+    p.add_argument(
+        "--tri-skeleton-opacity",
+        type=float,
+        default=0.95,
+        help="Opacity of the BC-colored triangle skeleton overlay (default 0.95)",
+    )
+    p.add_argument(
+        "--tri-skeleton-line-width",
+        type=float,
+        default=2.0,
+        help="Line width for the triangle skeleton overlay (default 2.0)",
     )
     p.add_argument("--cmap", type=str, default="turbo", help="Colormap (point mode)")
     p.add_argument(
@@ -664,6 +749,9 @@ def main() -> None:
     bc_faces: list[tuple[pv.PolyData, str, str]] | None = None
     load_points = None
     marker_radius = 1.0
+    tri_skeleton_mesh = None
+    tri_skeleton_scalar = None
+    tri_skeleton_labels = None
 
     if nito_sample is not None:
         shape, rho, bc, load, _vf = nito_sample
@@ -710,6 +798,20 @@ def main() -> None:
             )
             print(f"  BC face overlays: {len(bc_faces)} patch(es)")
 
+    if args.tri_skeleton:
+        try:
+            (
+                tri_skeleton_mesh,
+                tri_skeleton_scalar,
+                tri_skeleton_labels,
+            ) = _resolve_tri_skeleton_display(path, n_bc=n_bc)
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
+        print(
+            f"  tri skeleton overlay: {tri_skeleton_mesh.n_cells:,} triangles "
+            f"colored by {PATCH_ID_KEY}"
+        )
+
     plot_surface(
         mesh,
         scalar_name=scalar_name,
@@ -726,6 +828,11 @@ def main() -> None:
         load_points=load_points,
         marker_radius=marker_radius,
         bc_face_opacity=args.bc_face_opacity,
+        tri_skeleton_mesh=tri_skeleton_mesh,
+        tri_skeleton_scalar=tri_skeleton_scalar,
+        tri_skeleton_labels=tri_skeleton_labels,
+        tri_skeleton_opacity=args.tri_skeleton_opacity,
+        tri_skeleton_line_width=args.tri_skeleton_line_width,
     )
 
 

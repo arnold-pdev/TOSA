@@ -15,7 +15,7 @@ Forward FEA and shape-derivative post-processing use **FEniCSx** (surface workfl
 
 LPBF objectives follow [Bihr et al. (2022)](https://linkinghub.elsevier.com/retrieve/pii/S0045782522002274).
 
-Fetch scripts target the public [NITO dataset](https://drive.google.com/drive/folders/1uK_X3-FcCWY9LiiXkVQDI69q0t6Vosgm) (Nobari, Regenwetter, Ahmed, 2024): voxel topologies iso-surfaced with marching cubes and smoothing, distributed as VTK PolyData (`.vtp`). Legacy `.stl` mirrors may exist during conversion. See the [NITO-3D paper](https://decode.mit.edu/assets/papers/nobari_2024_nito3d.pdf), [NITO_Public](https://github.com/ahnobari/NITO_Public), and [public/ATTRIBUTION.md](public/ATTRIBUTION.md).
+Fetch scripts target the public [NITO dataset](https://drive.google.com/drive/folders/1uK_X3-FcCWY9LiiXkVQDI69q0t6Vosgm) (Nobari, Regenwetter, Ahmed, 2024): voxel topologies are stored as cell-centered density grids. TOSA's current extraction path treats those voxels as FEM cells, not as point samples for marching cubes: exposed solid-cell faces are converted to quads, diagonal-only contacts are kept split in the surface graph, and optional constrained fairing smooths the result. Legacy `.vtp`/`.stl` mirrors may exist during conversion. See the [NITO-3D paper](https://decode.mit.edu/assets/papers/nobari_2024_nito3d.pdf), [NITO_Public](https://github.com/ahnobari/NITO_Public), and [public/ATTRIBUTION.md](public/ATTRIBUTION.md).
 
 ## Prerequisites
 
@@ -117,17 +117,23 @@ Generated artifacts are gitignored under `nito/Data/`, `nito/Checkpoints/`, `out
 ```mermaid
 flowchart LR
   subgraph inputs [NITO sample i]
-    G0[STL / VTP / topology]
+    G0[cell-centered topology]
     S[shapes.npy]
     BC[boundary_conditions.npy]
     L[loads.npy]
     VF[vfs.npy]
   end
 
+  subgraph extract [Surface extraction]
+    V2S[voxel2surf]
+    SURF[face-connected surface]
+    V2S --> SURF
+  end
+
   subgraph mesh [Meshing]
-    GM[Gmsh / TetGen]
+    VH[voxel_hex (structured)]
     VM[volume mesh]
-    GM --> VM
+    VH --> VM
   end
 
   subgraph fea [FEniCSx]
@@ -148,8 +154,12 @@ flowchart LR
     VTP --> PV
   end
 
-  G0 --> GM
-  S --> GM
+  G0 --> V2S
+  S --> V2S
+  BC --> V2S
+  L --> V2S
+  SURF --> VH
+  S --> VH
   VM --> SOLVE
   BC --> SOLVE
   L --> SOLVE
@@ -161,15 +171,33 @@ flowchart LR
 
 | Stage | Role |
 |-------|------|
-| **NITO data** | `topologies[i]` or post-processed `.vtp`/`.stl`; `shapes[i]` grid size; `boundary_conditions[i]` and `loads[i]` (normalized coords — scale by `np.max(shapes[i])`); `vfs[i]` volume-fraction target. |
-| **Meshing** | Automatic volume mesh (Gmsh / TetGen); see [Automatic meshing](#automatic-meshing) below. |
+| **NITO data** | `topologies[i]` is one density per structured cell; `shapes[i]` is the cell grid size; `boundary_conditions[i]` and `loads[i]` give normalized anchor positions and flags/vectors; `vfs[i]` is the volume-fraction target. |
+| **Surface extraction** | `voxel2surf` thresholds the cell densities, emits one quad per exposed solid-cell face, welds vertices only through 6-connected voxel material, labels BC faces from cuberille provenance, and applies optional constrained fairing. |
+| **Meshing** | Structured voxel-hex volume mesh (DOLFINx) from the binary occupancy; build layers / element birth are trivial on the Cartesian grid. |
 | **FEniCSx** | Isotropic linear elasticity; apply NITO BCs/loads; solve for **u**. |
 | **Shape derivatives** | On external faces: contract strain and stress (e.g. ε:σ); map to surface mesh scalars for objectives such as compliance and LPBF metrics. |
 | **Visualization** | `scripts/surface/visualize.py` colors `.vtp` by point/cell scalars. |
 
+### Voxel topology extraction
+
+NITO/ATOMS 3D designs are interpreted as **cell-centered** topology fields. For a sample `i`, `topologies[i]` is reshaped to `shapes[i]` with C order, then thresholded into solid/void cells. Classic marching cubes on that `(nx, ny, nz)` array would treat the values as grid samples, which is not the FEM interpretation used by the voxel compliance path.
+
+The small extractor in `scripts/lib/converters/voxel2surf/` follows the voxel FEM connectivity instead:
+
+| Step | Implementation | Behavior |
+|------|----------------|----------|
+| Extract | `extract.cuberille_mesh` | Emits one quad for each exposed face of a solid cell. No SDF, no iso-level interpolation, and no tolerance welds. |
+| Weld | `extract.cuberille_mesh` | Vertex keys include the grid corner and the face-connected component of the local 8-voxel rosette. Face-adjacent cells share vertices; edge-only or corner-only contacts become coincident but separate surface sheets. |
+| Provenance | `extract.cuberille_mesh` | Each quad records `(cell, axis, side)` so later stages can map labels back to voxel faces. |
+| Constraints | `label.classify` | Free/face/edge/corner taxonomy from box-face provenance: face vertices slide in-plane, edge vertices along the edge line, corners and NITO load anchors fixed, interior verts free. |
+| BC labels | `label.bc_quad_ids` / `face_bc_arrays` | BC-patch ids assigned exactly on cuberille quads from voxel-face provenance and propagated through subdivision; output `cell_data` only, not the smoothing constraint. |
+| Fairing | `fair.solve_implicit` | Constrained variational fairing: a thin-plate (bi-Laplacian) energy minimized subject to the equality constraints + an occupancy corridor — the discrete obstacle problem — solved by primal-dual active set. Taubin λ\|μ remains as a fast fallback (`--fair-mode taubin`). |
+
+This means diagonal "kitty-corner" voxel contacts do **not** create a mechanical joint in the extracted surface graph. They may occupy the same geometric edge or point, but they are not welded unless the solid cells are connected through faces, matching how forces communicate in the structured voxel FEM model.
+
 ### Automatic meshing
 
-Meshing is **automatic**: from each sample’s surface (`.vtp`/`.stl` or voxel iso-surface) and NITO `boundary_conditions` / `loads`, the pipeline builds a tetrahedral volume mesh with **non-uniform** sizing. A coarse baseline covers the interior; **fine resolution is concentrated only where the physics and the shape-derivative outputs require it**. That keeps batch runs tractable without sacrificing the quantities we actually export on the surface.
+Meshing is **automatic**: from each sample’s extracted surface and NITO `boundary_conditions` / `loads`, the pipeline builds a tetrahedral volume mesh with **non-uniform** sizing. A coarse baseline covers the interior; **fine resolution is concentrated only where the physics and the shape-derivative outputs require it**. That keeps batch runs tractable without sacrificing the quantities we actually export on the surface.
 
 Gmsh/TetGen size fields (or equivalent background-mesh controls) are driven by three criteria:
 
@@ -409,10 +437,12 @@ Surface shape derivatives (FEniCS path) will use boundary contraction of strain 
 scripts/
   lib/                  # shared modules
     nito_io.py, nito_physics.py, surface_io.py, stl_common.py, paths.py
-    meshing/            # automatic volume mesh (Gmsh / TetGen)
-      size_fields.py    # boundary / load / feature sizing
-      mesh.py           # backend dispatch
-      gmsh.py, tetgen.py
+    meshing/            # structured voxel-hex volume mesh (DOLFINx)
+      voxel_hex.py      # occupancy (voxel/surface) → tagged hex mesh; --refine
+      mesh.py, types.py, surface_tags.py
+    converters/
+      bc_patch.py       # shared NITO BC/load patch parsing
+      voxel2surf/       # cuberille extraction + variational fairing (obstacle problem)
     fea/                # FEniCSx solve + boundary postprocess
       bcs.py, problem.py, postprocess.py
   fetch/                # downloads + colocated .sh wrappers
@@ -432,7 +462,8 @@ Legacy top-level `scripts/sensitivity/` and `scripts/sensitivity_analysis/` have
 | `scripts/fetch/data_3d.sh` | 3D train → `nito/Data/3D/` |
 | `scripts/fetch/stl.sh` | Selected STLs → `public/stl/` |
 | `scripts/fetch/checkpoints.sh` | NITO checkpoints |
-| `scripts/lib/meshing/` | Automatic volume meshing (size fields, Gmsh/TetGen) |
+| `scripts/lib/converters/voxel2surf/` | Cell-centered voxel topology → face-connected surface |
+| `scripts/lib/meshing/` | Structured voxel-hex volume meshing (DOLFINx) |
 | `scripts/lib/fea/` | FEniCSx elasticity + boundary shape-derivative postprocess |
 | `scripts/surface/sensitivity/main.py` | Orchestrator: mesh → FEA → `.vtp` (in progress) |
 | `scripts/voxel/sensitivity/compliance.py` | Voxel ∂C/∂ρ (ATOMS) |

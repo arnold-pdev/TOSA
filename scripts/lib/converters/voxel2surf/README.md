@@ -1,363 +1,274 @@
 # voxel2surf
 
-Convert NITO voxel topologies into tagged VTK surfaces (`.vtp`) for FEA meshing.
+Convert a **binary voxel topology** (a NITO topology-optimization result, thresholded
+to 0/1) into a **smooth, watertight, FEM-ready surface mesh** that (a) is faithful to
+the voxel occupancy, (b) preserves thin members, (c) carries the boundary-condition /
+load tags, and (d) does not shrink.
 
-**Entry point:** `python scripts/lib/converters/voxel2surf.py --index N`
-
-**Package:** `scripts/lib/converters/voxel2surf/`
+The headline idea: surface fairing here is **not a filter, it is the discrete
+*obstacle problem*** — minimize a thin-plate bending energy plus a soft fidelity term,
+subject to a per-vertex occupancy corridor and an axis-aligned constraint hierarchy,
+solved as a bound-constrained quadratic program. This document explains every stage,
+the reasoning behind it, and the literature it draws on. The lineage report with full
+bibliographic detail is in [`binary_smoothing.md`](binary_smoothing.md).
 
 ---
 
-## Quick start
+## 0. Why this is hard (and why plain smoothing fails)
 
-```bash
-# List named pipelines
-python scripts/lib/converters/voxel2surf.py --list-recipes
+Binarizing a density field at `ρ ≥ 0.5` commits the **topology** (which voxels are
+solid, how they connect) but discards the **sub-voxel geometry**. The raw "cuberille"
+surface is therefore blocky, and recovering a smooth surface from it is a
+*reconstruction* problem, not a *filtering* problem. Two failure modes dominate naive
+smoothing (e.g. Taubin λ|μ):
 
-# Default production path
-python scripts/lib/converters/voxel2surf.py --index 119 --recipe pyvista_taubin
+- **Shrinkage / thin-member collapse** — an unconstrained smoother has no notion of
+  *where the surface should be*, so opposite walls of a one-voxel member diffuse
+  together and the member necks off.
+- **Residual staircase on shallow edges** — the staircase there is *low-frequency*
+  (long runs + occasional steps), so it sits in a low-pass filter's pass band and
+  survives any number of iterations.
 
-# Experiment run directory (VTP, logs, metrics CSV, manifest)
-python scripts/lib/converters/voxel2surf.py --index 119 \
-  --recipe pyvista_taubin \
-  --run-dir output/surfaces/runs/pyvista-taubin-119
+Both are failures of having **no data term and no occupancy constraint**. Everything
+below exists to add those, correctly.
+
+---
+
+## 1. Extraction — `extract.py`
+
+`cuberille_mesh(vox, origin, spacing, density_cutoff)` → `verts, faces (quads), prov`.
+
+- **What:** one quad per *exposed* voxel face (cuberille / "opaque cube" surface,
+  **Herman & Liu 1979**). Vertices sit at grid corners; a quad indexes the four
+  corners of an exposed face.
+- **The weld (why it's not just marching cubes):** corners are welded across voxels
+  only where they are **face-connected** (6-connectivity), evaluated locally per grid
+  corner from its 8-voxel "rosette" via a precomputed 256×8 component table. This makes
+  the **surface graph's connectivity identical to the voxel FEM's face-connectivity**:
+  diagonal (edge/vertex) contacts split into separate manifold sheets; face contacts
+  fuse. This is the load-bearing reason we use cuberille rather than a dual method
+  (Surface Nets / dual contouring): we want *explicit, exact* control of topology at the
+  ambiguous configurations, not the implicit decisions a dual extractor makes. Pure
+  occupancy also lacks the Hermite normals dual contouring needs (**Ju et al. 2002**).
+- **Provenance seeded here:** `prov["vmask"]` is a per-vertex **6-bit box-face mask**
+  read *exactly* from the integer grid key (no tolerance) — bit `2·axis+side`. This is
+  the seed for the constraint labelling and is propagated through refinement (Stage 3).
+
+---
+
+## 2. Constraint labelling — `label.py`
+
+The smoothing must respect the design-domain box: a surface vertex on a box face may
+only slide *in* that face, a vertex on a box edge only *along* that edge, a corner is
+fixed. `classify(...)` produces a `Constraints` record encoding this.
+
+- **The taxonomy.** Because the box planes are axis-aligned, each face pins one
+  *coordinate*. The admissible motion is therefore set by the **number of distinct axes
+  pinned**:
+
+  | distinct axes | class | DOF | projector `P` |
+  |---|---|---|---|
+  | 0 | free | 3 | `I` |
+  | 1 | on_face | 2 | `I − nnᵀ` (slide in plane) |
+  | 2 | on_edge | 1 | `d dᵀ` (slide along edge line) |
+  | 3 | on_corner | 0 | `0` (fixed) |
+
+  Load anchors are additionally fixed. This is the standard Dirichlet-boundary treatment
+  of variational fairing (**Botsch & Sorkine 2008**) specialized to axis-aligned planes;
+  the specialization is what makes the later solve *separable per coordinate*.
+
+- **Provenance, not geometry.** The 6-bit mask comes from `face_mask=vmask` (exact),
+  not from re-testing vertex coordinates against the box with a tolerance. Through
+  subdivision the mask propagates by **bitwise AND** (`mask[midpoint] = mask[a] & mask[b]`)
+  — a midpoint lies on a coordinate plane iff *both* parents do, so AND is exactly the
+  plane-intersection rule. This keeps constraints exact across refinement levels and
+  avoids the tolerance fragility that produced spurious BC residuals.
+
+- **BC / load tags.** `bc_quad_ids` assigns each cuberille quad its support-patch id by
+  *exact integer* voxel-face match (no centroid geometry); `bc_vertex_mask` lifts that to
+  a per-vertex mask that rides the same subdivision AND; `face_bc_arrays` reads the final
+  per-face `patch_id` / `fix_x,y,z` / `boundary_type` back off the mask ("all corners
+  agree"). No post-mesh geometric re-derivation, so no spill-over artifacts.
+
+---
+
+## 3. Fairing — `fair.py` (+ `corridor.py`)
+
+Two modes, deliberately **not** on equal footing:
+
+- **`implicit` (primary)** — the discrete obstacle problem. Solves the actual
+  reconstruction problem (smooth + occupancy-consistent + non-shrinking).
+- **`taubin` (fast fallback)** — the original explicit λ|μ filter. Fast, but has **no
+  corridor and no data term**, so it can collapse thin members. For previews/comparison.
+
+The two share the cotangent operator and the constraint pins; `taubin` is a degenerate
+special case of `implicit` (explicit, truncated, no corridor, membrane-only).
+
+### 3a. The discrete operators
+
+- **Cotangent Laplacian** `Lₛ = D − A` (`_cotangent_laplacian`), with clamped cotangent
+  edge weights (**Pinkall & Polthier 1993**). This is the discretization of the
+  Dirichlet energy `xᵀLₛx`.
+- **Lumped mass matrix** `M` (`_lumped_mass`), barycentric Voronoi vertex areas
+  (**Meyer, Desbrun, Schröder & Barr 2003**). Needed so the bi-Laplacian is
+  geometrically correct on irregular triangles.
+
+### 3b. The energy: thin-plate, not membrane
+
+`solve_implicit(..., order=...)` minimizes a smoothness energy:
+
+- **`thin-plate` (default):** `Q = Lₛ M⁻¹ Lₛ` — the **bi-Laplacian** / thin-plate
+  bending energy (**Kobbelt 1997**; **Botsch & Sorkine 2008**). It is **non-shrinking**
+  (minimizing curvature does not pull toward a point) and **C¹ at constraints** (no
+  membrane "tent"/kink — this subsumes the Taubin §4.2 smooth-interpolation trick we
+  briefly used and then retired).
+- **`membrane`:** `Q = Lₛ` — first-order Dirichlet energy. *Shrinks catastrophically*
+  (soap-film/minimal-surface collapse — exactly what Taubin's μ-step exists to fight),
+  so it is offered only for comparison.
+
+### 3c. The data term (anti-shrink)
+
+The energy alone still drifts. From **pure binary** the only honest target is "stay on
+the cuberille boundary," so we add a **soft positional fidelity term**
+`½·w·‖x − x₀‖²` (the `reg` / `--data-weight` argument; `x₀` = cuberille position). This
+is the smoothness-plus-fidelity least-squares structure of **Nealen, Igarashi, Sorkine
+& Alexa 2006 ("Laplacian Mesh Optimization")**. Crucially, the thin-plate energy's
+*shrinking* motion is mostly **normal** to the surface, so an *isotropic* spring to `x₀`
+preferentially resists shrinkage while leaving **tangential smoothing free** — and it
+keeps the per-coordinate separability. This single term is what fixed the shrinkage; it
+also regularizes the solve enough to remove self-intersections.
+
+### 3d. The occupancy corridor — `corridor.py`
+
+`derive_bounds(verts, vox, origin, spacing, ...)` → per-vertex axis-aligned box
+`[lo, hi]`. This is the hard inequality constraint that makes it an **obstacle problem**,
+and the direct descendant of **Gibson's Constrained Elastic Surface Nets (1998)** —
+per-cell containment to keep thin features from collapsing — generalized from
+cell-centered nodes to our corner vertices via a **regularized signed-distance transform
+of the binary** (the binary SDT is severely quantized, so it is Gaussian-smoothed first).
+The corridor is **asymmetric/thickness-adaptive**: tight on the inward (toward-solid)
+side at thin members, generous tangentially. After the data term took over the
+anti-shrink role, the corridor is demoted to a **loose safety leash + thin-feature
+protection** (`--corridor-voxels`).
+
+### 3e. The formulation and the solver
+
+Putting 3a–3d together, per coordinate axis we solve a **bound-constrained convex QP**
+
+> minimize `½ xᵀQx + ½·ε·‖x − x₀‖²`  s.t.  `x[pinned]=target`,  `lo ≤ x ≤ hi`
+
+which is the **discrete obstacle problem** (**Lions & Stampacchia 1967**); `Q` is SPD.
+Because the pins and corridor are axis-aligned, this **separates into three independent
+scalar QPs** sharing `Q`.
+
+- **Solver: primal-dual active set (PDAS) = semismooth Newton** (`_solve_axis_bounded`,
+  **Hintermüller, Ito & Kunisch 2002**). Each round predicts the active set from the
+  bound multiplier `μ + c₀(x − bound)` — which lets a vertex *leave* a bound, not just
+  join it — fixes active vertices to their bound, and solves the SPD system on the
+  inactive set. This converges to the *true* constrained minimizer, so the surface meets
+  the corridor **tangentially** (C¹ contact) instead of creasing — fixing the
+  self-intersections a naive "clamp-and-freeze" active set produces. A **best-feasible-
+  energy globalization** guards against PDAS's occasional cycling. (Robust alternative:
+  Moré–Toraldo GPCG; scalability escalation past ~10⁶ vertices: Kornhuber monotone
+  multigrid — both in [`binary_smoothing.md`](binary_smoothing.md).)
+
+### 3f. Taubin (fallback) — `constrained_taubin`, `smooth_interpolate`
+
+The original explicit λ|μ filter (**Taubin 1995**): `x ← x + f·P·(Wx − x)` with row-
+normalized neighbour operator `W`, the constraint projector `P`, and Taubin's
+shrink/anti-shrink coefficients. `λ=0.5` annihilates the mesh Nyquist mode (the
+staircase); `μ` is derived from a pass-band frequency. An optional §4.2 "smooth
+interpolation" (`smooth_interpolate`, fixed uniform precomputed kernel, eqn 10) gives
+non-tent constraint interpolation. Kept only as the fast path; the implicit solver
+supersedes all of it.
+
+---
+
+## 4. Refinement — `subdivide`, `decimate_to`
+
+- **`subdivide`** — one 1→4 midpoint subdivision, implemented in numpy so the provenance
+  masks (box-face + BC) ride through by AND. Quads are triangulated here.
+- **`decimate_to`** — quadric edge-collapse to a triangle budget (pyvista), boundary-
+  preserving. The BC mask is carried across by nearest-source transfer (decimation drops
+  vertex parentage). Scheduling (`--sub-levels`, `--target-faces`) lives in `mesh_surface`.
+
+The constraint and corridor are **re-derived per resolution level**, so the formulation
+is resolution-robust: the data term anchors the *physical* geometry, decoupling "where
+the surface is" from the iteration/face count.
+
+---
+
+## 5. Orchestration & validation — `main.py`
+
+`mesh_surface(...)` runs: extract → BC label → native fair → optional subdivisions →
+optional decimate → `validate` → BC cell-data → return. `validate` gates the result on
+**watertightness**, **non-self-intersection** (a vectorized Möller broadphase that
+excludes the flat BC patches), **inter-body overlap**, **BC-plane residual**,
+**load-on-surface**, and reports volume-fraction delta and free-skin dihedral. The
+`Options` dataclass is the single source of tunables; `cli.py` is a thin wrapper.
+
+---
+
+## 6. Why not just Taubin? — limitations and how they are addressed
+
+| Taubin limitation | resolution here |
+|---|---|
+| No data term — only band-limits; low-frequency staircase unremovable; drifts | **Soft data term** `½w‖x−x₀‖²` gives the surface a target and resists drift (§3c) |
+| Shrinkage, no per-location lower bound → thin members collapse | **Thin-plate energy** (non-shrinking, §3b) + **corridor** (§3d) + **data term** (the decisive lever) |
+| Explicit relaxation: slow, spectrum-limited, CFL step cap | **Implicit solve** — one SPD system, all frequencies at once (§3e) |
+| Constraints via per-step "reset" → tent/kink at point constraints | Thin-plate gives **C¹ at constraints** natively; constraints enter exactly (§3b, §3e) |
+| Output is a resolution-coupled *transient*, not a defined object | The variational form has a **well-defined minimizer** (§3e) |
+| Over-constrains box edges (pins them) | **Taxonomy** gives correct per-class motion; axis-alignment makes it separable (§2) |
+
+Conceptual continuity: **Taubin's iteration *is* gradient descent on the membrane
+energy; this pipeline replaces the relaxation with an implicit *solve* of a richer
+energy (thin-plate + data) over a *constraint set* (pins + corridor).** It is an
+evolution of Taubin, not a different family — which is why the cotangent operator and a
+subordinate explicit fast-path are retained.
+
+---
+
+## 7. CLI quick reference
+
+```
+PYTHONPATH=scripts python -m lib.converters.voxel2surf.cli \
+    --index 119 -o output/surfaces/small/119.vtp
 ```
 
-Canonical probe index: **119**.
-
-**Preferred production path:** `pyvista_taubin` (VF-neutral mesh smooth) or `pyvista_laplacian` (lighter smooth).
-
----
-
-## Current status
-
-### Production default (monolithic BC)
-
-The default pipeline keeps BC faces on the extracted iso-surface:
-
-```
-extract → bc_build → bc_transfer → bc_enforce → [smooth] → bc_enforce → validate
-```
-
-Triangles are labeled by voxel footprint (`bc_transfer`), coplanar faces are claimed on NITO planes (`bc_claim_coplanar`), then hard-snapped (`bc_enforce`). Smoothing freezes BC vertices and re-projects them each iteration.
-
-On index **119** this path typically yields:
-
-| Metric | Typical value |
-|--------|----------------|
-| `bc_plane_max_residual` | 0 |
-| `bc_footprint_coverage` | ~99.8% (with coplanar claim) |
-| `bc_labeled_triangles` | ~3,051 |
-| Load checks | pass |
-| Watertight | yes (single body) |
-
-### Removed: cap weld / stitch assembly
-
-Earlier work built planar caps separately and welded them to the free skin (`stitch`, rim weld, coplanar strip). That path was **removed** — independent rim tessellation cannot be made watertight by tolerance snapping. Planar contouring (`bc_planar_cap`) remains for **audit only** (caps are not assembled onto the skin).
-
-### Experimental: critique-proposal backends
-
-Three alternative backends are wired as **parallel stage slots** (same recipe/stage pattern as extract × smooth) for validation comparison:
-
-| Recipe | Stage | Status on 119 |
-|--------|-------|----------------|
-| `pyvista_shared_seam_taubin` | `bc_assembly=shared_seam` | Runs; **not watertight** (`body_count=5`) — rim chain + merge need edge-split work |
-| `sdf_field_smooth_taubin` | `sdf_field_smooth` + `tangential_bc` | Runs; VF calibration needs tuning (~+2% delta) |
-| `sdf_bc_planes_taubin` | `sdf_bc_planes` extract | Runs; incremental BC-at-field step (~−1% VF delta) |
-
-Compare with `./batch/run_validation_critique_methods.sh` (dataset `critique-methods-v1`).
-
-Full dual contouring / OpenVDB surfacing is **not** implemented; `sdf_bc_planes` pins the SDF on BC slabs before Lewiner MC.
+| flag | meaning |
+|---|---|
+| `--fair-mode implicit\|taubin` | primary obstacle-problem solve vs fast Taubin fallback |
+| `--smooth-order thin-plate\|membrane` | bending (non-shrinking) vs stretching (shrinks) energy |
+| `--data-weight` | soft pull to the boundary — the **hug ↔ smooth** knob (anti-shrink) |
+| `--corridor-voxels` | SDF corridor half-width (loose safety + thin-feature protection) |
+| `--implicit-iters` | PDAS active-set rounds |
+| `--sub-levels N` | unconditional ×4 midpoint subdivisions |
+| `--target-faces T` | decimate to T triangles (omit → keep resolution) |
+| `--on-fail warn\|raise` | behaviour when validation gates fail |
 
 ---
 
-## Recipes
-
-Recipes are named by what they do — no version prefixes.
-
-### Production
-
-| CLI `--recipe` | What it does |
-|----------------|--------------|
-| `pyvista_laplacian` | PyVista iso-surface + BC pin + Laplacian smooth |
-| `pyvista_taubin` | **Preferred** — PyVista + BC pin + Taubin smooth |
-| `pyvista_taubin_regrow` | PyVista + geodesic BC regrow + Taubin |
-| `pyvista_hc` | PyVista + Humphrey–Carlson smooth + BC pin |
-| `sdf_lewiner_calibrated` | SDF Lewiner MC + VF isolevel calibration + Taubin |
-| `sdf_masked_taubin` | BC-masked SDF field + Lewiner MC + Taubin |
-| `sdf_lewiner_raw` | SDF Lewiner MC (no VF calibration) + Taubin |
-| `sdf_lewiner_snap` | SDF + Taubin + post-smooth SDF vertex snap |
-| `extract_baseline` | Extract + BC enforce only (no smooth) |
-
-### Experimental (critique proposals)
-
-| CLI `--recipe` | What it does |
-|----------------|--------------|
-| `pyvista_shared_seam_taubin` | Plane-cut seam + Delaunay caps + merge + Taubin |
-| `sdf_field_smooth_taubin` | Gaussian SDF smooth + VF cal + tangential Taubin |
-| `sdf_bc_planes_taubin` | BC-plane pinned SDF (`bc_build` before extract) + Taubin |
-
-### QA / audit
-
-| CLI `--recipe` | What it does |
-|----------------|--------------|
-| `planar_cap_contour` | Monolithic extract + planar cap contour audit (caps not on skin) |
-
-Deprecated aliases (`v3_taubin`, `extract_only`, `cuberille_stitch_taubin`, …) still resolve with a warning.
-
----
-
-## Pipeline architecture
-
-Stages run in recipe order. Each stage exposes swappable backends via recipe defaults or CLI flags.
-
-| Module | Stages |
-|--------|--------|
-| `stages/extract.py` | `extract` |
-| `stages/bc.py` | `bc_build`, `bc_transfer`, `bc_enforce`, `bc_planar_cap` |
-| `stages/bc_assembly.py` | `bc_assembly` |
-| `stages/refine.py` | `subdivide`, `smooth`, `snap`, `bc_regrow` |
-| `stages/validate.py` | `validate` |
-
-### Monolithic path (default)
-
-```
-extract → bc_build → bc_transfer → bc_enforce
-  → [bc_planar_cap] → [bc_regrow] → [subdivide] → [smooth] → [snap] → bc_enforce → validate
-```
-
-`bc_assembly` is omitted (or `monolithic` = no-op).
-
-### Shared-seam path (`pyvista_shared_seam_taubin`)
-
-```
-extract → bc_build → bc_transfer → bc_assembly → bc_enforce
-  → [subdivide] → [smooth] → bc_enforce → validate
-```
-
-`bc_assembly=shared_seam` strips MC BC caps, builds planar caps on plane-cut rim polylines, merges with the free skin (`lib/meshing/shared_seam.py`).
-
-### SDF BC-planes path (`sdf_bc_planes_taubin`, `sdf_masked_taubin`)
-
-```
-bc_build → extract → bc_transfer → bc_enforce → …
-```
-
-Patches must exist before extract so the SDF can be pinned or masked at BC slabs.
-
-### Parallel backends
-
-| Stage | Option | Backends |
-|-------|--------|----------|
-| **extract** | `--extractor` | `pyvista_binary`, `sdf_lewiner`, `sdf_masked`, `sdf_field_smooth`, `sdf_bc_planes` |
-| **bc_assembly** | `--bc-assembly` | `monolithic` (default), `shared_seam` |
-| **smooth** | `--smoother` | `laplacian_bc`, `taubin_bc`, `hc_bc`, `tangential_bc`, `none` |
-
-Registries: `stages/extract.py`, `stages/bc_assembly.py` (`BC_ASSEMBLY_RUNNERS`), `stages/refine.py`.
-
-Implementation entry points for critique methods:
-
-- `lib/meshing/shared_seam.py` — seam extraction + cap merge
-- `lib/converters/bc_planar_cap.py` — `triangulate_cap_on_plane`, contour methods
-- `lib/meshing/field.py` — SDF, BC Dirichlet pin, masked smooth
-- `lib/meshing/surface_smooth.py` — `tangential_taubin_smooth`
-
----
-
-## Stage reference
-
-### `extract`
-
-Build the initial iso-surface from the voxel solid.
-
-| Option | CLI flag | Default | Description |
-|--------|----------|---------|-------------|
-| `extractor` | `--extractor` | recipe | See parallel backends table |
-| `iso_level` | `--iso-level` | `0.5` | PyVista contour level |
-| `repair` | `--no-repair` | `True` | trimesh / MeshFix cleanup |
-| `meshfix_verbose` | `--meshfix-verbose` | `False` | MeshFix log noise |
-| `upsample_factor` | `--upsample-factor` | `1` | Voxel upsample before SDF |
-| `field_smooth_sigma` | `--field-smooth-sigma` | `0.0` | Gaussian SDF smooth (σ in voxels); `sdf_field_smooth` defaults to 0.35 |
-| `field_bc_mask` | `--field-bc-mask` | `False` | Mask SDF at BC planes during field smooth |
-| `calibrate_vf` | `--calibrate-vf` | recipe | Bisect SDF isolevel to match voxel VF |
-
-### `bc_build`
-
-Build analytic NITO BC patches from `bcspecs` / `bc.npy` rows. No tunable options.
-
-### `bc_transfer`
-
-Label mesh triangles with patch IDs from voxel footprints.
-
-| Option | CLI flag | Default | Description |
-|--------|----------|---------|-------------|
-| `bc_transfer` | `--bc-transfer` | `centroid` | `centroid` or `cell_native` (stricter) |
-| `bc_transfer_band_cells` | `--bc-transfer-band-cells` | `1.0` | Plane proximity band in cells |
-
-### `bc_enforce`
-
-Snap BC triangles onto NITO analytic planes; flatten interiors; audit footprint.
-
-| Option | CLI flag | Default | Description |
-|--------|----------|---------|-------------|
-| `bc_claim_coplanar` | `--no-bc-claim-coplanar` | `True` | Claim unlabeled tris on BC planes in footprint |
-| `bc_strict_footprint` | `--bc-strict-footprint` | `False` | Drop labeled tris outside voxel footprint |
-| `bc_plane_tol` | `--bc-plane-tol` | `1e-5` | Coplanarity tolerance (world units) |
-| `on_bc_fail` | `--on-bc-fail` | `raise` | `raise` or `warn` on plane residual breach |
-| `bc_oracle` | `--bc-oracle` | `False` | Cuberille gap metrics (QA) |
-
-Runs twice in smoothed recipes (before and after smooth).
-
-### `bc_assembly`
-
-Replace MC BC caps with analytic planar caps (shared-seam backend only).
-
-| Option | CLI flag | Default | Description |
-|--------|----------|---------|-------------|
-| `bc_assembly` | `--bc-assembly` | recipe | `monolithic` (no-op) or `shared_seam` |
-
-Steps for `shared_seam`: strip labeled BC tris → plane-cut rim segments → chain to loops → Delaunay cap per patch → merge vertices with free skin.
-
-### `bc_planar_cap` (optional, audit-only)
-
-Contour voxel footprints into smooth planar caps. Writes cap mesh to `state.bc_mesh` and audit metrics; does **not** modify the skin mesh.
-
-| Option | CLI flag | Default | Description |
-|--------|----------|---------|-------------|
-| `bc_planar_cap` | `--bc-planar-cap` | `False` | Enable contour audit stage |
-| `bc_planar_cap_method` | `--bc-planar-cap-method` | `upsample_blur` | **`upsample_blur`** (preferred), `native_contour` |
-| `bc_planar_cap_upsample` | `--bc-planar-cap-upsample` | `4` | Footprint mask upsample factor |
-| `bc_planar_cap_blur_sigma` | `--bc-planar-cap-blur-sigma` | `1.0` | Blur σ in cells (`upsample_blur`) |
-| `bc_planar_cap_outward_buffer` | `--bc-planar-cap-outward-buffer` | `0.25` | Outward buffer in cells |
-
-### `bc_regrow`
-
-Geodesic BC patch regrow (`pyvista_taubin_regrow` only).
-
-| Option | CLI flag | Default | Description |
-|--------|----------|---------|-------------|
-| `bc_regrow` | `--bc-regrow` | `none` | `none` or `geodesic` |
-
-### `subdivide`
-
-Loop subdivision before smooth.
-
-| Option | CLI flag | Default | Description |
-|--------|----------|---------|-------------|
-| `subdivide_levels` | `--subdivide-levels` | `0` | Subdivision iterations |
-| `subdivide_free_only` | `--subdivide-free-only` | `False` | Subdivide only unlabeled triangles |
-
-### `smooth`
-
-Surface smoothing with BC vertex freeze.
-
-| Option | CLI flag | Default | Description |
-|--------|----------|---------|-------------|
-| `smoother` | `--smoother` | recipe | `laplacian_bc`, `taubin_bc`, `hc_bc`, `tangential_bc`, `none` |
-| `laplacian_iters` | `--laplacian-iters` | `8` | Laplacian iterations |
-| `laplacian_relaxation` | `--laplacian-relaxation` | `0.5` | Laplacian ω |
-| `taubin_iters` | `--taubin-iters` | `10` | Taubin / tangential iterations |
-| `taubin_lambda` | `--taubin-lambda` | `0.5` | Taubin λ |
-| `taubin_k_pb` | `--taubin-k-pb` | `0.1` | Taubin pass-band frequency; μ derived from λ and k_PB |
-| `taubin_mu` | `--taubin-mu` | derived | Explicit signed Taubin μ (<0); overrides k_PB. `--taubin-nu` deprecated |
-| `hc_iters` | `--hc-iters` | `10` | HC iterations |
-| `hc_lambda` | `--hc-lambda` | `0.5` | HC λ |
-| `hc_alpha` | `--hc-alpha` | `0.1` | HC α |
-| `constrain_bc_planes` | `--no-constrain-bc-planes` | `True` | Re-project BC verts to planes each iter |
-| `laplacian_freeze_rings` | `--laplacian-freeze-rings` | `0` | BC transition ring freeze width |
-| `smooth_free_only` | `--smooth-free-only` | `False` | Smooth only unlabeled triangles |
-
-`tangential_bc` projects Laplacian steps onto the local tangent plane (pair with `sdf_field_smooth` extract).
-
-### `snap`
-
-Post-smooth SDF vertex reprojection (`sdf_lewiner_snap`).
-
-| Option | CLI flag | Default | Description |
-|--------|----------|---------|-------------|
-| `snap_to_sdf` | `--snap-to-sdf` | recipe | Enable SDF snap |
-| `snap_to_sdf_steps` | `--snap-to-sdf-steps` | `3` | Snap iterations |
-
-### `validate`
-
-Final volume fraction, BC audits, free-boundary smoothness, load surface checks.
-
-| Option | CLI flag | Default | Description |
-|--------|----------|---------|-------------|
-| `vf_tol_cells` | `--vf-tol-cells` | `2.0` | Soft VF gate (cells) |
-| `check_loads` | `--no-load-check` | `True` | Verify NITO load anchors on surface |
-| `load_surface_tol_cells` | `--load-surface-tol-cells` | `1.0` | Load distance tolerance |
-| `on_load_fail` | `--on-load-fail` | `raise` | `raise` or `warn` |
-
----
-
-## Global CLI flags
-
-| Flag | Description |
-|------|-------------|
-| `--index N` | NITO topology index (required) |
-| `--data-dir PATH` | NITO `Data/3D` root |
-| `--density-cutoff` | Binarization threshold (default `0.5`) |
-| `--no-bc` | Skip BC patches entirely |
-| `-o PATH` / `--run-dir PATH` | Output VTP or experiment directory |
-| `-q` | Quiet (summary only) |
-
----
-
-## Validation matrices
-
-| Script | Dataset ID | Purpose |
-|--------|------------|---------|
-| `./batch/run_validation.sh` | `compatible-pipelines-v1` | Production recipes: extract, smooth, SDF variants |
-| `./batch/run_validation_planar_cap.sh` | `planar-cap-v1` | Planar cap contour methods (audit-only) |
-| `./batch/run_validation_critique_methods.sh` | `critique-methods-v1` | Monolithic vs shared-seam vs field-smooth vs BC-planes SDF |
-
-```bash
-# View metrics for one index
-python scripts/surface/view_validation.py --dataset critique-methods-v1 --index 119
-
-# Open a mesh interactively
-python scripts/surface/view_validation.py --dataset compatible-pipelines-v1 --index 119 --open pyvista_taubin
-```
-
-See [`batch/VALIDATION_DATASET.md`](../../../batch/VALIDATION_DATASET.md) for output layout and CSV columns.
-
----
-
-## Output
-
-Tagged VTK PolyData (`.vtp`):
-
-- `cell_data`: `patch_id`, `facet_marker`, `fix_x/y/z`
-- `FieldData`: patch metadata for FEA importers
-
----
-
-## Known limitations
-
-1. **MC stairsteps on free boundary** — PyVista binary extract produces axis-aligned facets; smoothing trades against VF and dihedral quality.
-2. **VF under mesh smooth** — Laplacian is not volume-neutral (`vf_delta ≈ −0.4%` on 119); prefer `pyvista_taubin`, `sdf_lewiner_snap`, or field-smooth backends when VF matters.
-3. **BC labeling is heuristic** — centroid/cell-native transfer + coplanar claim; optional `--bc-strict-footprint`.
-4. **Shared-seam not production-ready** — prototype merges caps by vertex proximity; watertightness and footprint coverage regress on 119 until edge-split seam welding lands.
-5. **Field-smooth VF** — `sdf_field_smooth_taubin` needs σ / calibration tuning; not yet within the 2-cell soft gate.
-6. **No full feature-aware extractor** — `sdf_bc_planes` is an incremental step, not dual contouring / OpenVDB.
-
----
-
-## Future work
-
-| Priority | Item |
-|----------|------|
-| P0 | **Shared-seam edge-split merge** — weld cap/free interface edges, not just vertex proximity |
-| P1 | **Field-smooth calibration** — default σ sweep; pair `tangential_bc` with VF gate on 119+ |
-| P1 | **Feature-aware extraction** — extend `sdf_bc_planes` toward dual contouring / OpenVDB |
-| P2 | **Expand validation indices** — beyond 119 for regression |
-| P2 | **Remove deprecated recipe aliases** — after downstream scripts updated |
-
----
-
-## Related docs
-
-- [`PIPELINES.md`](../PIPELINES.md) — short recipe table
-- [`VALIDATION.md`](VALIDATION.md) — acceptance gates and phase notes
-- [`batch/VALIDATION_DATASET.md`](../../../batch/VALIDATION_DATASET.md) — dataset builder usage
+## References
+
+- Herman & Liu (1979), *Three-dimensional display of human organs from computed tomograms*, CGIP. — cuberille.
+- Taubin (1995), *A Signal Processing Approach to Fair Surface Design*, SIGGRAPH. — λ|μ filter.
+- Pinkall & Polthier (1993), *Computing Discrete Minimal Surfaces and Their Conjugates*, Exp. Math. — cotangent weights.
+- Desbrun, Meyer, Schröder & Barr (1999), *Implicit Fairing of Irregular Meshes using Diffusion and Curvature Flow*, SIGGRAPH. — implicit fairing.
+- Meyer, Desbrun, Schröder & Barr (2003), *Discrete Differential-Geometry Operators for Triangulated 2-Manifolds*, VisMath. — mixed-Voronoi mass matrix.
+- Kobbelt (1997), *Discrete Fairing*, IMA Surfaces. — discrete membrane/thin-plate energies.
+- Botsch & Sorkine (2008), *On Linear Variational Surface Deformation Methods*, IEEE TVCG. — `Lₛ M⁻¹ Lₛ`, membrane vs thin-plate, `C^{k−1}`.
+- Botsch, Kobbelt, Pauly, Alliez & Lévy (2010), *Polygon Mesh Processing*, AK Peters. — textbook; fairing as constrained energy minimization.
+- Sorkine et al. (2004), *Laplacian Surface Editing*, SGP. — Dirichlet positional constraints, sparse SPD.
+- Nealen, Igarashi, Sorkine & Alexa (2006), *Laplacian Mesh Optimization*, GRAPHITE. — smoothness + soft positional fidelity (the data term).
+- Gibson (1998), *Constrained Elastic Surface Nets: Generating Smooth Surfaces from Binary Segmented Data*, MICCAI. — the corridor's ancestor.
+- Frisken (2022), *SurfaceNets for Multi-Label Segmentations…*, JCGT; vtkSurfaceNets3D (Schroeder et al., 2023). — modern SurfaceNets.
+- Ju, Losasso, Schaefer & Warren (2002), *Dual Contouring of Hermite Data*, SIGGRAPH. — lineage; needs Hermite data we don't have.
+- Lions & Stampacchia (1967), *Variational inequalities*, CPAM. — obstacle-problem theory.
+- Moré & Toraldo (1991), *On the Solution of Large QP with Bound Constraints*, SIAM J. Optim. — GPCG.
+- Hintermüller, Ito & Kunisch (2002), *The Primal-Dual Active Set Strategy as a Semismooth Newton Method*, SIAM J. Optim. — the solver.
+- Kornhuber (1994/1996), *Monotone multigrid methods for elliptic variational inequalities I/II*, Numer. Math. — scalable obstacle solver.
+
+> The exact pipeline — cuberille-corner mesh + provenance constraints + per-axis
+> bi-Laplacian box-QP + soft data term from pure binary — is a *synthesis* of the above;
+> no single prior paper states it. See [`binary_smoothing.md`](binary_smoothing.md) for
+> the full lineage analysis and solver survey.

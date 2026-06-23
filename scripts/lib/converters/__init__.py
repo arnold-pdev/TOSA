@@ -1,19 +1,9 @@
-"""Voxel ↔ surface conversion utilities."""
+"""Voxel ↔ surface conversion utilities.
+
+The active surface pipeline is the :mod:`lib.converters.voxel2surf` package
+(cuberille extraction + constrained variational fairing); see its ``README.md``.
+BC/load patch parsing shared with the hex mesher is in
+:mod:`lib.converters.bc_patch`.
+"""
 
 from __future__ import annotations
-
-__all__ = [
-    "PipelineOptions",
-    "SurfaceOutputFormat",
-    "SurfaceResult",
-    "save_surface",
-    "voxel_to_surface",
-]
-
-
-def __getattr__(name: str):
-    if name in __all__:
-        import lib.converters.voxel2surf as _voxel2surf
-
-        return getattr(_voxel2surf, name)
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

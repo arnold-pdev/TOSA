@@ -22,6 +22,7 @@ output/surfaces/runs/*
 !output/surfaces/runs/.gitkeep
 output/surfaces/validation/*
 !output/surfaces/validation/.gitkeep
+output/surfaces/small/
 
 # --- Surface meshes (VTP distribution; legacy STL cache) ---
 public/vtp/
